@@ -1,0 +1,27 @@
+{
+  "name": "pandabomber-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reinforcement-learning training for PandaBomber bots. Trains a self-play DQN agent in a faithful TS port of the gameserver and exports plain-JSON weights that bot2.ts can load with no extra dependencies.",
+  "scripts": {
+    "train": "ts-node src/train.ts",
+    "train:gpu": "TFJS_GPU=1 ts-node src/train.ts",
+    "profile": "ts-node src/profile.ts",
+    "profile:gpu": "TFJS_GPU=1 ts-node src/profile.ts",
+    "eval": "ts-node src/eval.ts",
+    "test": "ts-node src/sim_test.ts",
+    "test:parity": "ts-node src/parity_test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^4.20.0"
+  },
+  "optionalDependencies": {
+    "@tensorflow/tfjs-node-gpu": "^4.20.0"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.0"
+  }
+}
