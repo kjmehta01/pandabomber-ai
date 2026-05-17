@@ -435,7 +435,7 @@ export class Sim {
                     if (this.blocks[r][c] === 'W') {
                         this.blocks[r][c] = undefined;
                         this.woodLeft--;
-                        this.players[cell.sourceOwnerIdx].rewardThisStep += 1.0;
+                        this.players[cell.sourceOwnerIdx].rewardThisStep += 0.2;
                         this.players[cell.sourceOwnerIdx].stats.woodDestroyed++;
                         this.maybeSpawnPowerup(r, c);
                     }
@@ -503,7 +503,7 @@ export class Sim {
         p.dyDir = 0; p.dxDir = 0;
         if (!this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
         if (attacker !== p) {
-            attacker.rewardThisStep += 10.0;
+            attacker.rewardThisStep += 15.0;
             attacker.stats.killsScored++;
         } else {
             p.stats.diedFromOwnBomb = 1;
@@ -560,7 +560,7 @@ export class Sim {
                 const tier = Math.round((p.moveSpeed - START_MOVE_SPEED) / MOVE_SPEED_INCREMENT) + 1;
                 if (tier < MAX_POWERUPS) p.moveSpeed += MOVE_SPEED_INCREMENT;
             }
-            p.rewardThisStep += 1.5;
+            p.rewardThisStep += 0.5;
             p.stats.powerupsCollected++;
         }
     }
@@ -583,11 +583,19 @@ export class Sim {
         if (alive.length === 0) return true;
         if (alive.length === 1 && this.cfg.numPlayers > 1) {
             if (!this.ranking.includes(alive[0].idx)) this.ranking.unshift(alive[0].idx);
-            alive[0].rewardThisStep += 20.0;
+            alive[0].rewardThisStep += 30.0;
             return true;
         }
         if (this.elapsedMs >= this.cfg.maxTimeMs) {
-            for (const p of this.players) if (p.alive && !this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
+            // Stalemate: penalize every player still alive at timeout. Without this,
+            // mutual avoidance is a viable strategy — the per-step penalty alone
+            // doesn't deter two scared bots from both surviving to the clock.
+            for (const p of this.players) {
+                if (p.alive) {
+                    p.rewardThisStep -= 15.0;
+                    if (!this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
+                }
+            }
             return true;
         }
         return false;
@@ -621,7 +629,7 @@ export class Sim {
         this.updateTimers(SIM_DT_MS);
 
         // 8) Per-step survival penalty so STAY isn't always the safest pick.
-        for (const p of this.players) if (p.alive) p.rewardThisStep -= 0.005;
+        for (const p of this.players) if (p.alive) p.rewardThisStep -= 0.008;
 
         this.done = this.gameOver();
         return { rewards: this.players.map(p => p.rewardThisStep), done: this.done };

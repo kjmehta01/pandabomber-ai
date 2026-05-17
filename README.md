@@ -62,16 +62,17 @@ For each agent, egocentric view:
 
 | Event | Reward |
 |---|---|
-| Destroy wood block | +1.0 |
-| Collect powerup | +1.5 |
+| Destroy wood block | +0.2 |
+| Collect powerup | +0.5 |
 | Knock an enemy | +5.0 |
-| Kill an enemy | +10.0 |
+| Kill an enemy | +15.0 |
 | Get knocked | −10.0 |
 | Die | −30.0 |
-| Win the game | +20.0 |
-| Per simulation step | −0.005 |
+| Win the game | +30.0 |
+| Per simulation step | −0.008 |
+| Alive at timeout (stalemate) | −15.0 |
 
-Wood and powerup rewards bootstrap the early-game block-clearing phase; knock/kill rewards drive the combat phase; survival pressure shapes endgame play.
+Wood/powerup rewards bootstrap the early-game block-clearing phase but are deliberately small so combat is unambiguously the dominant strategy (max wood farm ≈ +22 vs a single kill at +15). Knock/kill rewards drive the combat phase; the kill payoff is 3× the knock so chasing the kill always beats trading knocks. Survival pressure (-0.008/step) plus the stalemate penalty shape endgame play — passive mutual-survival to timeout is heavily negative.
 
 ## Usage
 

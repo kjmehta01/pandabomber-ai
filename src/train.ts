@@ -45,6 +45,7 @@ interface Args {
     batchSize: number;
     gamma: number;
     learnEvery: number;
+    nStep: number;          // n-step return horizon — credits a single transition with the next n rewards
     targetTau: number;
     epsStart: number;
     epsEnd: number;
@@ -69,6 +70,11 @@ function parseArgs(): Args {
         batchSize: 128,
         gamma: 0.99,
         learnEvery: 8,
+        // n=5 reaches across a bomb fuse (~300 ticks) only weakly, but propagates
+        // post-knock kill credit (~600 ticks horizon for a knock-then-kill) much
+        // faster than 1-step TD bootstrapping through V(s). Higher n trades
+        // credit-assignment reach for TD-target variance; 5 is a common sweet spot.
+        nStep: 5,
         targetTau: 0.005,
         epsStart: 1.0,
         epsEnd: 0.05,
@@ -99,6 +105,11 @@ function parseArgs(): Args {
 
 // Fixed-size ring replay buffer. Storing Float32Arrays directly is cheaper than tensors
 // and lets us copy-slice into one batch tensor at sample time.
+//
+// Stores n-step transitions: `r` is the discounted n-step return, `sNext` is the obs n
+// decisions later, `nStep` is how many decisions of lookahead were actually accumulated
+// (less than the target n near episode boundaries). The learn step uses γ^nStep on the
+// bootstrap term.
 class ReplayBuffer {
     cap: number;
     size = 0;
@@ -108,6 +119,7 @@ class ReplayBuffer {
     act: Int32Array;
     rew: Float32Array;
     done: Uint8Array;
+    nStep: Int32Array;
 
     constructor(capacity: number) {
         this.cap = capacity;
@@ -116,24 +128,27 @@ class ReplayBuffer {
         this.act = new Int32Array(capacity);
         this.rew = new Float32Array(capacity);
         this.done = new Uint8Array(capacity);
+        this.nStep = new Int32Array(capacity);
     }
 
-    push(s: Float32Array, a: number, r: number, sNext: Float32Array, done: boolean) {
+    push(s: Float32Array, a: number, r: number, sNext: Float32Array, done: boolean, nStep: number) {
         this.obs[this.head] = s;
         this.next[this.head] = sNext;
         this.act[this.head] = a;
         this.rew[this.head] = r;
         this.done[this.head] = done ? 1 : 0;
+        this.nStep[this.head] = nStep;
         this.head = (this.head + 1) % this.cap;
         if (this.size < this.cap) this.size++;
     }
 
-    sample(n: number): { s: Float32Array; a: Int32Array; r: Float32Array; sNext: Float32Array; done: Uint8Array } {
+    sample(n: number): { s: Float32Array; a: Int32Array; r: Float32Array; sNext: Float32Array; done: Uint8Array; nStep: Int32Array } {
         const sBuf = new Float32Array(n * OBS_SIZE);
         const sNextBuf = new Float32Array(n * OBS_SIZE);
         const aBuf = new Int32Array(n);
         const rBuf = new Float32Array(n);
         const dBuf = new Uint8Array(n);
+        const nStepBuf = new Int32Array(n);
         for (let i = 0; i < n; i++) {
             const idx = Math.floor(Math.random() * this.size);
             sBuf.set(this.obs[idx], i * OBS_SIZE);
@@ -141,8 +156,9 @@ class ReplayBuffer {
             aBuf[i] = this.act[idx];
             rBuf[i] = this.rew[idx];
             dBuf[i] = this.done[idx];
+            nStepBuf[i] = this.nStep[idx];
         }
-        return { s: sBuf, a: aBuf, r: rBuf, sNext: sNextBuf, done: dBuf };
+        return { s: sBuf, a: aBuf, r: rBuf, sNext: sNextBuf, done: dBuf, nStep: nStepBuf };
     }
 }
 
@@ -170,6 +186,30 @@ class OpponentPool {
         for (const e of this.entries) e.weights.forEach(w => w.dispose());
         this.entries = [];
     }
+}
+
+// One queued decision: the obs the seat saw, the action it picked, and the reward earned
+// by that action across the ticks between this decision and the next (filled in on the
+// next decision, since the action's reward isn't known yet at queue-push time).
+interface StepEntry {
+    obs: Float32Array;
+    act: Action;
+    reward: number;
+}
+
+// Pop the oldest entry from `queue` and push it to `buffer` as an n-step transition.
+// Uses the first `nSteps` queue entries to compute the discounted return; `bootstrapObs`
+// is the obs `nSteps` decisions later (or the terminal obs if `done`).
+function pushNStep(buffer: ReplayBuffer, queue: StepEntry[], bootstrapObs: Float32Array, done: boolean, nSteps: number, gamma: number) {
+    const head = queue[0];
+    let nReturn = 0;
+    let g = 1;
+    for (let k = 0; k < nSteps; k++) {
+        nReturn += g * queue[k].reward;
+        g *= gamma;
+    }
+    buffer.push(head.obs, head.act, nReturn, bootstrapObs, done, nSteps);
+    queue.shift();
 }
 
 function epsilon(step: number, a: Args): number {
@@ -267,8 +307,10 @@ async function train() {
         }
 
         let obs = env.initialObs();
-        let prevObs: Array<Float32Array | null> = new Array(numPlayers).fill(null);
-        let prevAct: Array<Action | null> = new Array(numPlayers).fill(null);
+        // Per-seat n-step queue of pending decisions. Each entry's reward is filled in when
+        // the NEXT decision arrives (we accumulate per-tick rewards into `pendingReward[i]`
+        // between decisions, then commit that sum into the most recently queued entry).
+        const stepQueue: StepEntry[][] = Array.from({ length: numPlayers }, () => []);
         let pendingReward: Float32Array = new Float32Array(numPlayers);
         let totalReward: Float32Array = new Float32Array(numPlayers);
         let done = false;
@@ -308,11 +350,20 @@ async function train() {
                 // Learner explores; opponents play greedy from their frozen policy.
                 const a = i === 0 ? pickAction(q, eps) : argmax(q);
                 actions.push(a);
-                if (prevObs[i] !== null && prevAct[i] !== null) {
-                    buffer.push(prevObs[i]!, prevAct[i]!, pendingReward[i], obs[i], false);
+                // Finalize the previously queued decision (if any): its action has been
+                // executing since it was queued, and pendingReward holds the rewards it
+                // earned over that interval.
+                const q_i = stepQueue[i];
+                if (q_i.length > 0) {
+                    q_i[q_i.length - 1].reward = pendingReward[i];
                 }
-                prevObs[i] = obs[i];
-                prevAct[i] = a;
+                // If the queue is now at capacity, the oldest entry has seen its full
+                // n-step lookahead. Flush it to the replay buffer with obs[i] as the
+                // bootstrap state (= the obs n decisions after the oldest one).
+                if (q_i.length >= args.nStep) {
+                    pushNStep(buffer, q_i, obs[i], false, args.nStep, args.gamma);
+                }
+                q_i.push({ obs: obs[i], act: a, reward: 0 });
                 pendingReward[i] = 0;
             }
 
@@ -327,21 +378,29 @@ async function train() {
             // Learning step.
             if (buffer.size >= args.batchSize && globalStep % args.learnEvery === 0) {
                 const batch = buffer.sample(args.batchSize);
+                // Precompute per-sample γ^n_steps[i] in JS — varies because terminal-
+                // flush transitions have n < args.nStep.
+                const gammaNBuf = new Float32Array(args.batchSize);
+                for (let i = 0; i < args.batchSize; i++) {
+                    gammaNBuf[i] = Math.pow(args.gamma, batch.nStep[i]);
+                }
                 tf.tidy(() => {
                     const [sSpatial, sScalar] = flatBatchToTensors(batch.s, args.batchSize);
                     const [sNextSpatial, sNextScalar] = flatBatchToTensors(batch.sNext, args.batchSize);
                     const aT = tf.tensor1d(batch.a, 'int32');
                     const rT = tf.tensor1d(batch.r);
                     const dT = tf.tensor1d(Float32Array.from(batch.done));
+                    const gammaNT = tf.tensor1d(gammaNBuf);
 
-                    // Double DQN target: a* from online net, value from target net.
+                    // Double DQN target with n-step return: a* from online net, value
+                    // from target net; bootstrap is γ^n · Q_target(s_{+n}, a*).
                     const qNextOnline = online.predict([sNextSpatial, sNextScalar]) as tf.Tensor;
                     const aStar = qNextOnline.argMax(1);
                     const qNextTarget = target.predict([sNextSpatial, sNextScalar]) as tf.Tensor;
                     const indices = aStar.cast('int32');
                     const oneHot = tf.oneHot(indices, NUM_ACTIONS);
                     const qNextSel = qNextTarget.mul(oneHot).sum(1);
-                    const yT = rT.add(qNextSel.mul(args.gamma).mul(tf.scalar(1).sub(dT)));
+                    const yT = rT.add(qNextSel.mul(gammaNT).mul(tf.scalar(1).sub(dT)));
 
                     const grads = tf.variableGrads(() => {
                         const q = online.predict([sSpatial, sScalar]) as tf.Tensor;
@@ -362,10 +421,16 @@ async function train() {
             stepInGame++;
         }
 
-        // Flush trailing transitions with done=true.
+        // Flush trailing queued transitions with done=true. The last queued entry per
+        // seat still has reward=0 because no further decision arrived to commit
+        // pendingReward into it — do that first, then drain the queue with truncated
+        // n-step returns (length = remaining queue depth).
         for (let i = 0; i < numPlayers; i++) {
-            if (prevObs[i] !== null && prevAct[i] !== null) {
-                buffer.push(prevObs[i]!, prevAct[i]!, pendingReward[i], obs[i], true);
+            const q_i = stepQueue[i];
+            if (q_i.length === 0) continue;
+            q_i[q_i.length - 1].reward = pendingReward[i];
+            while (q_i.length > 0) {
+                pushNStep(buffer, q_i, obs[i], true, q_i.length, args.gamma);
             }
         }
 
