@@ -81,7 +81,7 @@ function parseArgs(): Args {
         targetTau: 0.005,
         epsStart: 1.0,
         epsEnd: 0.05,
-        epsDecaySteps: 3_000_000,
+        epsDecaySteps: 500_000,
         epsOpponent: 0.05,
         warmupSteps: 10_000,
         learningRate: 1e-4,
@@ -172,9 +172,14 @@ function perBeta(step: number, a: Args): number {
 
 function pickAction(qValues: Float32Array, eps: number): Action {
     if (Math.random() < eps) return Math.floor(Math.random() * NUM_ACTIONS) as Action;
+    // Reservoir tie-break: uniform among argmax candidates so flat Q's don't lock onto action 0.
     let best = 0;
     let bestV = qValues[0];
-    for (let i = 1; i < NUM_ACTIONS; i++) if (qValues[i] > bestV) { bestV = qValues[i]; best = i; }
+    let nTies = 1;
+    for (let i = 1; i < NUM_ACTIONS; i++) {
+        if (qValues[i] > bestV) { bestV = qValues[i]; best = i; nTies = 1; }
+        else if (qValues[i] === bestV) { nTies++; if (Math.random() < 1 / nTies) best = i; }
+    }
     return best as Action;
 }
 
@@ -291,6 +296,9 @@ async function train() {
     const pool = new OpponentPool(args.poolSize);
     const stats = new EpisodeStats();
 
+    // Reset on each summary log so values are means over the last `logEvery` episodes' learn steps.
+    let learnLossAcc = 0, learnTdAcc = 0, learnQAcc = 0, learnGradAcc = 0, learnCount = 0;
+
     for (let ep = startEpisode; ep < startEpisode + args.episodes; ep++) {
         // Curriculum: easier 2-player games for the first N episodes, then 4-player.
         const numPlayers = ep < startEpisode + args.curriculumEpisodes
@@ -403,10 +411,12 @@ async function train() {
                     const yT = rT.add(qNextSel.mul(gammaNT).mul(tf.scalar(1).sub(dT)));
 
                     let absDeltaKept: tf.Tensor | undefined;
+                    let qSelKept: tf.Tensor | undefined;
                     const grads = tf.variableGrads(() => {
                         const q = online.predict([sSpatial, sScalar]) as tf.Tensor;
                         const aOH = tf.oneHot(aT, NUM_ACTIONS);
                         const qSel = q.mul(aOH).sum(1);
+                        qSelKept = tf.keep(qSel.clone());
                         // IS-weighted Huber. Written as 0.5*min(|δ|,1)² + (|δ|−min(|δ|,1))
                         // instead of tf.where(|δ|<1, ...) because tfjs-node has no
                         // registered gradient for Less, which the tape errors on
@@ -422,6 +432,21 @@ async function train() {
 
                     const tdArr = absDeltaKept!.dataSync() as Float32Array;
                     for (let i = 0; i < args.batchSize; i++) absTd[i] = tdArr[i];
+
+                    const lossVal = (grads.value.dataSync() as Float32Array)[0];
+                    const tdMean = (absDeltaKept!.mean().dataSync() as Float32Array)[0];
+                    const qMean = (qSelKept!.mean().dataSync() as Float32Array)[0];
+                    const gradNorm = tf.tidy(() => {
+                        const sqSums = Object.values(grads.grads).map(g => (g as tf.Tensor).square().sum());
+                        return tf.addN(sqSums).sqrt();
+                    });
+                    const gradNormVal = (gradNorm.dataSync() as Float32Array)[0];
+                    gradNorm.dispose();
+                    learnLossAcc += lossVal;
+                    learnTdAcc += tdMean;
+                    learnQAcc += qMean;
+                    learnGradAcc += gradNormVal;
+                    learnCount++;
 
                     optimizer.applyGradients(grads.grads as unknown as Parameters<typeof optimizer.applyGradients>[0]);
                 });
@@ -480,12 +505,18 @@ async function train() {
             numPlayers,
         });
 
+        const lc = Math.max(1, learnCount);
+        const learnLine = learnCount > 0
+            ? ` learn[n=${learnCount}]: loss=${(learnLossAcc / lc).toExponential(2)} |td|=${(learnTdAcc / lc).toFixed(3)} q=${(learnQAcc / lc).toFixed(3)} gradNorm=${(learnGradAcc / lc).toFixed(3)}`
+            : ' learn[n=0]';
         console.log(
             `[train] ep=${ep} step=${globalStep} eps=${epsilon(globalStep, args).toFixed(3)} ` +
-            `np=${numPlayers} rLearner=${totalReward[0].toFixed(1)} rOpp=${oppRewardMean.toFixed(1)} ` +
+            `np=${numPlayers} rLearner=${totalReward[0].toFixed(2)} rOpp=${oppRewardMean.toFixed(2)} ` +
             `wood=${ls.woodDestroyed} kills=${ls.killsScored} alive=${learnerPlayer.alive ? 1 : 0} ` +
-            `bufSize=${buffer.size} opps=${opponentSources.slice(1).join(',')} pool=${pool.size()}/${args.poolSize} (pPool=${poolOppCount})`
+            `bufSize=${buffer.size} opps=${opponentSources.slice(1).join(',')} pool=${pool.size()}/${args.poolSize} (pPool=${poolOppCount})` +
+            learnLine
         );
+        learnLossAcc = 0; learnTdAcc = 0; learnQAcc = 0; learnGradAcc = 0; learnCount = 0;
 
         if ((ep + 1) % args.logEvery === 0) {
             const s = stats.summary(args.logEvery)!;
@@ -494,7 +525,7 @@ async function train() {
                 `stalemate=${(s.stalemateRate * 100).toFixed(1)}% survive=${(s.survivalRate * 100).toFixed(1)}% ` +
                 `wood=${s.wood.toFixed(1)} kills=${s.kills.toFixed(2)} knocks=${s.knocks.toFixed(2)} deaths=${s.deaths.toFixed(2)} ` +
                 `ownBomb=${s.ownBomb.toFixed(2)} bombs=${s.bombs.toFixed(1)} powerups=${s.powerups.toFixed(1)} ` +
-                `rLearner=${s.rLearner.toFixed(1)} rOpp=${s.rOpp.toFixed(1)} steps=${s.steps.toFixed(0)}`
+                `rLearner=${s.rLearner.toFixed(2)} rOpp=${s.rOpp.toFixed(2)} steps=${s.steps.toFixed(0)}`
             );
         }
 

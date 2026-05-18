@@ -420,7 +420,7 @@ export class Sim {
                     if (this.blocks[r][c] === 'W') {
                         this.blocks[r][c] = undefined;
                         this.woodLeft--;
-                        this.players[cell.sourceOwnerIdx].rewardThisStep += 1.0;
+                        this.players[cell.sourceOwnerIdx].rewardThisStep += 0.1;
                         this.players[cell.sourceOwnerIdx].stats.woodDestroyed++;
                         this.maybeSpawnPowerup(r, c);
                     }
@@ -475,10 +475,10 @@ export class Sim {
                 p.firstDieTimeMs = this.elapsedMs;
             }
             if (attacker !== p) {
-                attacker.rewardThisStep += 5.0;
+                attacker.rewardThisStep += 0.5;
                 attacker.stats.knocksScored++;
             }
-            p.rewardThisStep -= 10.0;
+            p.rewardThisStep -= 1.0;
         } else {
             this.kill(p, attacker);
         }
@@ -490,12 +490,12 @@ export class Sim {
         p.dyDir = 0; p.dxDir = 0;
         if (!this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
         if (attacker !== p) {
-            attacker.rewardThisStep += 15.0;
+            attacker.rewardThisStep += 3.0;
             attacker.stats.killsScored++;
         } else {
             p.stats.diedFromOwnBomb = 1;
         }
-        p.rewardThisStep -= 30.0;
+        p.rewardThisStep -= 1.5;
 
         const numDrop = 4;
         const spots: [number, number][] = [];
@@ -547,7 +547,7 @@ export class Sim {
                 const tier = Math.round((p.moveSpeed - START_MOVE_SPEED) / MOVE_SPEED_INCREMENT) + 1;
                 if (tier < MAX_POWERUPS) p.moveSpeed += MOVE_SPEED_INCREMENT;
             }
-            p.rewardThisStep += 0.5;
+            p.rewardThisStep += 0.05;
             p.stats.powerupsCollected++;
         }
     }
@@ -570,7 +570,7 @@ export class Sim {
         if (alive.length === 0) return true;
         if (alive.length === 1 && this.cfg.numPlayers > 1) {
             if (!this.ranking.includes(alive[0].idx)) this.ranking.unshift(alive[0].idx);
-            alive[0].rewardThisStep += 30.0;
+            alive[0].rewardThisStep += 3.0;
             return true;
         }
         if (this.elapsedMs >= this.cfg.maxTimeMs) {
@@ -578,7 +578,7 @@ export class Sim {
             // viable and the per-step penalty alone doesn't break the stalemate.
             for (const p of this.players) {
                 if (p.alive) {
-                    p.rewardThisStep -= 15.0;
+                    p.rewardThisStep -= 1.5;
                     if (!this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
                 }
             }
@@ -603,7 +603,7 @@ export class Sim {
         this.updateTimers(SIM_DT_MS);
 
         // Per-step survival penalty so STAY isn't the universally safest pick.
-        for (const p of this.players) if (p.alive) p.rewardThisStep -= 0.003;
+        for (const p of this.players) if (p.alive) p.rewardThisStep -= 0.0003;
 
         this.done = this.gameOver();
         return { rewards: this.players.map(p => p.rewardThisStep), done: this.done };
