@@ -407,14 +407,15 @@ async function train() {
                         const q = online.predict([sSpatial, sScalar]) as tf.Tensor;
                         const aOH = tf.oneHot(aT, NUM_ACTIONS);
                         const qSel = q.mul(aOH).sum(1);
-                        // IS-weighted Huber, expanded by hand (tfjs's huberLoss
-                        // doesn't accept per-sample weights cleanly).
+                        // IS-weighted Huber. Written as 0.5*min(|δ|,1)² + (|δ|−min(|δ|,1))
+                        // instead of tf.where(|δ|<1, ...) because tfjs-node has no
+                        // registered gradient for Less, which the tape errors on
+                        // even when the bool tensor isn't on the gradient path.
                         const delta = qSel.sub(yT);
                         const absDelta = delta.abs();
                         absDeltaKept = tf.keep(absDelta.clone());
-                        const quad = delta.square().mul(0.5);
-                        const lin = absDelta.sub(0.5);
-                        const huber = tf.where(absDelta.less(1), quad, lin);
+                        const clipped = tf.minimum(absDelta, 1);
+                        const huber = clipped.square().mul(0.5).add(absDelta.sub(clipped));
                         const weighted = huber.mul(isW);
                         return weighted.mean() as tf.Scalar;
                     });
