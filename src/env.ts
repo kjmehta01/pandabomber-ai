@@ -1,7 +1,5 @@
-// Thin RL-env wrapper around Sim. Handles:
-//  - building per-player ObsView so the same encoder works in training and inference
-//  - skipping ticks until the controlled player is at a cell-aligned position
-//    (the only point where a new action takes effect)
+// RL wrapper around Sim. Builds per-player ObsView so the same encoder runs in
+// training and inference; a new action only takes effect at cell-aligned ticks.
 
 import { Sim, SimConfig, Action, ACTION_STAY, BOARD_H, BOARD_W, Bomb } from './sim';
 import { encode, ObsView } from './observation';
@@ -9,8 +7,8 @@ import { encode, ObsView } from './observation';
 export interface StepResult {
     rewards: number[];
     done: boolean;
-    obs: Float32Array[]; // one per player
-    cellAligned: boolean[]; // true if player is at a cell where action can be applied
+    obs: Float32Array[];
+    cellAligned: boolean[];
 }
 
 export class Env {
@@ -46,15 +44,14 @@ export class Env {
         };
     }
 
-    // Apply each player's action (or STAY for dead/knocked/non-aligned) and step once.
     step(actions: Action[]): StepResult {
         for (let i = 0; i < this.sim.players.length; i++) {
             const p = this.sim.players[i];
             if (!p.alive || p.knocked) continue;
+            // Mid-cell ticks re-commit pendingAction; new actions only apply at cell alignment.
             if (this.sim.isAtCell(i)) {
                 this.sim.setAction(i, actions[i]);
             } else {
-                // Keep the prior pendingAction in motion; ignore new actions mid-cell.
                 this.sim.setAction(i, p.pendingAction);
             }
         }

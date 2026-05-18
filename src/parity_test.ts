@@ -1,10 +1,7 @@
-// Parity test: confirms bot2's pure-JS forward pass matches tfjs's predict() bit-for-bit
-// (within floating-point tolerance). If this drifts, the trained model won't transfer.
-//
-// We replicate bot2's conv2d + dense routines here and feed both the model and the
-// hand-rolled forward the SAME weights + SAME observation.
+// Confirms bot2's pure-JS forward pass matches tfjs's predict() within float tolerance.
+// If this drifts, the trained model won't transfer to the gameserver.
 
-import './tfBackend'; // must come first — hijacks the tfjs-node module if TFJS_GPU=1
+import './tfBackend'; // must come first — hijacks tfjs-node if TFJS_GPU=1
 import * as tf from '@tensorflow/tfjs-node';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -12,7 +9,7 @@ import { Env } from './env';
 import { buildModel, exportWeights, importWeights, obsToTensors, SerializedModel } from './model';
 import { OBS_SIZE, OBS_SPATIAL_SIZE, BOARD_H, BOARD_W, NUM_CHANNELS, NUM_SCALARS } from './observation';
 
-// Copies of bot2's forward routines. Keep in sync with backend-gameserver/src/bot2.ts.
+// Mirrors backend-gameserver/src/bot2.ts — keep in sync.
 function conv2dRelu(input: Float32Array, inH: number, inW: number, inC: number,
                     kernel: Float32Array, kSize: number, outC: number, bias: Float32Array): Float32Array {
     const out = new Float32Array(inH * inW * outC);
@@ -59,7 +56,7 @@ function dense(input: Float32Array, kernel: Float32Array, bias: Float32Array, ou
 
 interface LayerW { kernel: Float32Array; kernelShape: number[]; bias: Float32Array }
 
-function loadLayers(ckpt: SerializedModel): { conv1: LayerW; conv2: LayerW; dense1: LayerW; q: LayerW } {
+function loadLayers(ckpt: SerializedModel): { conv1: LayerW; conv2: LayerW; dense1: LayerW; value: LayerW; advantage: LayerW } {
     const byName = new Map(ckpt.layers.map(l => [l.name, l]));
     const get = (n: string): LayerW => {
         const l = byName.get(n)!;
@@ -69,7 +66,7 @@ function loadLayers(ckpt: SerializedModel): { conv1: LayerW; conv2: LayerW; dens
             bias: Float32Array.from(l.weights[1].data),
         };
     };
-    return { conv1: get('conv1'), conv2: get('conv2'), dense1: get('dense1'), q: get('q') };
+    return { conv1: get('conv1'), conv2: get('conv2'), dense1: get('dense1'), value: get('value'), advantage: get('advantage') };
 }
 
 function jsForward(obs: Float32Array, w: ReturnType<typeof loadLayers>, meta: SerializedModel): Float32Array {
@@ -83,32 +80,36 @@ function jsForward(obs: Float32Array, w: ReturnType<typeof loadLayers>, meta: Se
     denseIn.set(a2, 0);
     denseIn.set(scalars, flatLen);
     const h = dense(denseIn, w.dense1.kernel, w.dense1.bias, denseUnits, true);
-    return dense(h, w.q.kernel, w.q.bias, numActions, false);
+    // Q[a] = V + (A[a] − mean A).
+    const v = dense(h, w.value.kernel, w.value.bias, 1, false);
+    const adv = dense(h, w.advantage.kernel, w.advantage.bias, numActions, false);
+    let aMean = 0;
+    for (let i = 0; i < numActions; i++) aMean += adv[i];
+    aMean /= numActions;
+    const q = new Float32Array(numActions);
+    for (let i = 0; i < numActions; i++) q[i] = v[0] + (adv[i] - aMean);
+    return q;
 }
 
 async function main() {
     const tmpPath = '/tmp/parity_ckpt.json';
-    // Build + save random weights.
     const model = buildModel();
     await exportWeights(model, tmpPath);
 
-    // Load JS-side weights from the saved JSON (same path bot2 takes).
+    // Re-load via the same JSON path bot2 takes at deploy.
     const ckpt = JSON.parse(fs.readFileSync(tmpPath, 'utf8')) as SerializedModel;
     const weights = loadLayers(ckpt);
 
-    // Build an observation by running a Sim a few ticks then pulling player 0's view.
     const env = new Env({ numPlayers: 4, seed: 42 });
     for (let i = 0; i < 50; i++) env.step([0, 0, 0, 0]);
     const obs = env.initialObs()[0];
 
-    // tfjs prediction.
     const tfQ = tf.tidy(() => {
         const [s, x] = obsToTensors(obs);
         const out = model.predict([s, x]) as tf.Tensor;
         return Array.from(out.dataSync());
     });
 
-    // JS-side prediction.
     const jsQ = Array.from(jsForward(obs, weights, ckpt));
 
     console.log('tfjs Q:', tfQ.map(v => v.toFixed(6)));

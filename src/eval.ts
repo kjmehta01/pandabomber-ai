@@ -1,31 +1,25 @@
-// Win-rate eval harness for trained PandaBomber agents.
+// Win-rate eval harness. Plays N deterministic games (ε=0, fixed seeds) between
+// a primary model and a list of baselines; reports win rate + behavioral metrics
+// per matchup. Seats alternate every other game so corner/first-mover bias cancels.
 //
-// Plays a configured number of deterministic games (ε=0, fixed seeds) between a
-// primary model and a set of baseline opponents, and reports win rate +
-// behavioral metrics per matchup. The output is the single artifact you can chart
-// over training time to know whether a new checkpoint is actually stronger.
-//
-// Baselines supported:
-//   noop                   — always STAY (sanity floor)
-//   random                 — uniform random action (seeded per-game for reproducibility)
-//   model:path/to/json     — another trained checkpoint (regression check)
+// Baselines:
+//   noop                — always STAY (sanity floor)
+//   random              — uniform random (seeded per game)
+//   model:path/to/json  — another trained checkpoint (regression check)
 //
 // Usage:
 //   npx ts-node src/eval.ts --model=checkpoints/latest.json \
 //                           --vs=noop,random,model:checkpoints/prev.json \
 //                           --games=100
-//
-// Seats are alternated across games so corner-spawn / first-mover bias washes out:
-// odd-numbered games swap which agent gets seat 0.
 
-import './tfBackend'; // must come first — hijacks the tfjs-node module if TFJS_GPU=1
+import './tfBackend'; // must come first — hijacks tfjs-node if TFJS_GPU=1
 import * as tf from '@tensorflow/tfjs-node';
 import * as fs from 'fs';
 import { Env } from './env';
 import { Sim, Action, ACTION_STAY, NUM_ACTIONS } from './sim';
 import { buildModel, importWeights, obsToTensors } from './model';
 
-const MAX_STEPS_PER_GAME = 15_000; // 150s @ 10ms — past the 120s in-game cap with margin
+const MAX_STEPS_PER_GAME = 15_000; // 150s @ 10ms — margin past the 120s in-game cap
 
 interface Agent {
     name: string;
@@ -38,7 +32,7 @@ function makeNoopAgent(): Agent {
 }
 
 function makeRandomAgent(seed: number): Agent {
-    // Each game seeds its own RNG so re-running eval with the same flags is identical.
+    // Seeded so re-runs with the same flags are bit-identical.
     let s = seed | 0 || 1;
     const rnd = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return ((s >>> 0) / 0x100000000); };
     return { name: 'random', selectAction: () => Math.floor(rnd() * NUM_ACTIONS) as Action };
@@ -54,7 +48,6 @@ async function makeModelAgent(modelPath: string, label: string): Promise<Agent> 
             const [spatial, scalar] = obsToTensors(obs);
             const q = model.predict([spatial, scalar]) as tf.Tensor;
             const data = q.dataSync();
-            // argmax — ε=0 by definition for eval.
             let best = 0, bestV = data[0];
             for (let i = 1; i < NUM_ACTIONS; i++) if (data[i] > bestV) { bestV = data[i]; best = i; }
             return best as Action;
@@ -72,9 +65,9 @@ interface PlayerStats {
 }
 
 interface GameResult {
-    winnerSeat: number;        // -1 if no clear winner (timeout / mutual KO)
+    winnerSeat: number;        // -1 if no clear winner
     durationMs: number;
-    stats: PlayerStats[];      // indexed by seat
+    stats: PlayerStats[];
 }
 
 function runGame(agents: Agent[], seed: number): GameResult {
@@ -101,8 +94,7 @@ function runGame(agents: Agent[], seed: number): GameResult {
         done = res.done;
         steps++;
     }
-    // ranking[0] is the most recent unshift — i.e. the survivor / latest die.
-    // Game-over branches always push the winner first, so ranking[0] is the winner.
+    // gameOver() always unshifts the winner first, so ranking[0] is the winner.
     const winnerSeat = env.sim.ranking.length > 0 ? env.sim.ranking[0] : -1;
     return {
         winnerSeat,
@@ -118,13 +110,12 @@ interface MatchAggregate {
     primaryWins: number;
     opponentWins: number;
     draws: number;
-    // Averages computed over all games where the primary agent participated as either seat.
     avgDurationMs: number;
     avgWoodDestroyed: number;
     avgPowerupsCollected: number;
     avgBombsPlaced: number;
     avgKillsScored: number;
-    suicideRate: number; // fraction of games where the primary died from its own bomb
+    suicideRate: number;
 }
 
 function runMatch(primary: Agent, opponent: Agent, games: number, baseSeed: number): MatchAggregate {
@@ -135,7 +126,6 @@ function runMatch(primary: Agent, opponent: Agent, games: number, baseSeed: numb
         avgBombsPlaced: 0, avgKillsScored: 0, suicideRate: 0,
     };
     for (let g = 0; g < games; g++) {
-        // Alternate seats every other game so corner / starting-position bias cancels.
         const primarySeat = g % 2;
         const agents = primarySeat === 0 ? [primary, opponent] : [opponent, primary];
         const result = runGame(agents, baseSeed + g);
@@ -166,7 +156,7 @@ interface Args {
     vs: string;        // comma-separated baselines
     games: number;
     seed: number;
-    json: string;      // optional path to write JSON results
+    json: string;      // optional output path
 }
 
 function parseArgs(): Args {
@@ -237,8 +227,8 @@ async function main() {
 
     const matches: MatchAggregate[] = [];
     for (const spec of opponentSpecs) {
-        // Use a distinct seed offset per matchup so e.g. the random agent uses different
-        // sequences across matchups (otherwise it'd play the same string of moves in each).
+        // Distinct seed per matchup so the random agent doesn't replay the same
+        // move sequence in every matchup.
         const seedOffset = matches.length * args.games * 7;
         const opponent = await buildOpponent(spec, args.seed + seedOffset);
         const t0 = Date.now();

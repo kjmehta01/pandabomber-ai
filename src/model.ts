@@ -1,20 +1,9 @@
-// Network architecture + weight serialization.
+// Dueling-DQN: two 3×3 conv layers (32 filters each) over the 13×19×11 spatial
+// input, scalars concatenated into a 64-unit dense head, then split into value (1)
+// and advantage (NUM_ACTIONS) streams combined as Q = V + (A − mean A).
 //
-// Architecture: small CNN over the spatial channels (13 × 19 × 11), with the scalar
-// features concatenated into the dense head:
-//   Conv 3×3 same  → 32 filters → ReLU
-//   Conv 3×3 same  → 32 filters → ReLU
-//   Flatten + concat scalars
-//   Dense 64 → ReLU
-//   Dense 6 (linear Q-values)
-//
-// The two-input model lets us reshape the spatial slice of the flat observation buffer
-// directly into a tensor4d without any transpose (the obs layout is already NHWC).
-// bot2.ts implements the same forward pass in pure JS (small conv2d loop + matmuls)
-// so the gameserver doesn't need TF.js.
-//
-// Weight serialization stores each layer's weights as { shape, data } so we can
-// round-trip 4D conv kernels and 2D dense kernels through the same code path.
+// bot2.ts re-implements this forward pass in pure JS (no TF.js at deploy time);
+// parity_test.ts checks they match bit-for-bit.
 
 import * as tf from '@tensorflow/tfjs-node';
 import {
@@ -32,7 +21,27 @@ export const CONV2_FILTERS = 32;
 export const DENSE_UNITS = 64;
 export const KERNEL_SIZE = 3;
 
-const LAYER_NAMES = ['conv1', 'conv2', 'dense1', 'q'] as const;
+const LAYER_NAMES = ['conv1', 'conv2', 'dense1', 'value', 'advantage'] as const;
+export const ARCH_TAG = 'cnn-dueling-v1';
+
+// Dueling combine layer: Q = V + (A − mean A). Stateless.
+class DuelingCombine extends tf.layers.Layer {
+    static className = 'DuelingCombine';
+    constructor(config?: object) { super(config ?? {}); }
+    computeOutputShape(inputShape: tf.Shape | tf.Shape[]): tf.Shape | tf.Shape[] {
+        const shapes = inputShape as tf.Shape[];
+        return shapes[1];
+    }
+    call(inputs: tf.Tensor | tf.Tensor[]): tf.Tensor {
+        return tf.tidy(() => {
+            const [v, a] = inputs as tf.Tensor[];
+            const aMean = a.mean(1, true);
+            return v.add(a.sub(aMean));
+        });
+    }
+    getClassName() { return DuelingCombine.className; }
+}
+tf.serialization.registerClass(DuelingCombine as unknown as tf.serialization.SerializableConstructor<tf.serialization.Serializable>);
 
 export function buildModel(): tf.LayersModel {
     const spatialInput = tf.input({ shape: [BOARD_H, BOARD_W, NUM_CHANNELS], name: 'spatial' });
@@ -48,39 +57,24 @@ export function buildModel(): tf.LayersModel {
     }).apply(x) as tf.SymbolicTensor;
     x = tf.layers.flatten().apply(x) as tf.SymbolicTensor;
     const combined = tf.layers.concatenate().apply([x, scalarInput]) as tf.SymbolicTensor;
-    let y: tf.SymbolicTensor = tf.layers.dense({
+    const y: tf.SymbolicTensor = tf.layers.dense({
         units: DENSE_UNITS, activation: 'relu', name: 'dense1',
     }).apply(combined) as tf.SymbolicTensor;
-    const q = tf.layers.dense({
-        units: NUM_ACTIONS, activation: 'linear', name: 'q',
-    }).apply(y) as tf.SymbolicTensor;
+
+    const v = tf.layers.dense({ units: 1, activation: 'linear', name: 'value' }).apply(y) as tf.SymbolicTensor;
+    const a = tf.layers.dense({ units: NUM_ACTIONS, activation: 'linear', name: 'advantage' }).apply(y) as tf.SymbolicTensor;
+    const q = new DuelingCombine().apply([v, a]) as tf.SymbolicTensor;
 
     return tf.model({ inputs: [spatialInput, scalarInput], outputs: q });
 }
 
-// Split a single flat observation into the (spatial, scalar) tensors the model expects.
-// Caller is responsible for disposing the returned tensors.
+// Caller owns dispose for all *ToTensors returns.
 export function obsToTensors(obs: Float32Array): [tf.Tensor4D, tf.Tensor2D] {
     const spatial = tf.tensor4d(obs.subarray(0, OBS_SPATIAL_SIZE), [1, BOARD_H, BOARD_W, NUM_CHANNELS]);
     const scalar = tf.tensor2d(obs.subarray(OBS_SPATIAL_SIZE), [1, NUM_SCALARS]);
     return [spatial, scalar];
 }
 
-// Batched version: pack N obs into one pair of tensors.
-export function obsBatchToTensors(obs: Float32Array[]): [tf.Tensor4D, tf.Tensor2D] {
-    const N = obs.length;
-    const spatialBuf = new Float32Array(N * OBS_SPATIAL_SIZE);
-    const scalarBuf = new Float32Array(N * NUM_SCALARS);
-    for (let i = 0; i < N; i++) {
-        spatialBuf.set(obs[i].subarray(0, OBS_SPATIAL_SIZE), i * OBS_SPATIAL_SIZE);
-        scalarBuf.set(obs[i].subarray(OBS_SPATIAL_SIZE), i * NUM_SCALARS);
-    }
-    const spatial = tf.tensor4d(spatialBuf, [N, BOARD_H, BOARD_W, NUM_CHANNELS]);
-    const scalar = tf.tensor2d(scalarBuf, [N, NUM_SCALARS]);
-    return [spatial, scalar];
-}
-
-// Same split, but for a contiguous batched flat buffer (used by the replay-sample path).
 export function flatBatchToTensors(flat: Float32Array, batchSize: number): [tf.Tensor4D, tf.Tensor2D] {
     const spatialBuf = new Float32Array(batchSize * OBS_SPATIAL_SIZE);
     const scalarBuf = new Float32Array(batchSize * NUM_SCALARS);
@@ -94,8 +88,14 @@ export function flatBatchToTensors(flat: Float32Array, batchSize: number): [tf.T
     return [spatial, scalar];
 }
 
+export function obsBatchToTensors(obs: Float32Array[]): [tf.Tensor4D, tf.Tensor2D] {
+    const flat = new Float32Array(obs.length * OBS_SIZE);
+    for (let i = 0; i < obs.length; i++) flat.set(obs[i], i * OBS_SIZE);
+    return flatBatchToTensors(flat, obs.length);
+}
+
+// Persisted across runs so warm-starts resume epsilon decay at the right step.
 export interface TrainingState {
-    // Cross-run training counters so warm-starts pick up epsilon-decay where they left off.
     globalStep: number;
     episode: number;
 }
@@ -105,8 +105,14 @@ interface SerializedWeight {
     data: number[];
 }
 
+interface SerializedOptVar {
+    name: string;
+    shape: number[];
+    data: number[];
+}
+
 export interface SerializedModel {
-    arch: 'cnn-v1';
+    arch: string;
     obsSize: number;
     numActions: number;
     boardH: number;
@@ -119,11 +125,17 @@ export interface SerializedModel {
     kernelSize: number;
     layers: Array<{ name: string; weights: SerializedWeight[] }>;
     trainingState?: TrainingState;
+    optimizerState?: SerializedOptVar[];
 }
 
-export async function exportWeights(model: tf.LayersModel, path: string, trainingState?: TrainingState): Promise<void> {
+export async function exportWeights(
+    model: tf.LayersModel,
+    path: string,
+    trainingState?: TrainingState,
+    optimizer?: tf.Optimizer,
+): Promise<void> {
     const out: SerializedModel = {
-        arch: 'cnn-v1',
+        arch: ARCH_TAG,
         obsSize: OBS_SIZE,
         numActions: NUM_ACTIONS,
         boardH: BOARD_H,
@@ -148,23 +160,40 @@ export async function exportWeights(model: tf.LayersModel, path: string, trainin
         }
         out.layers.push({ name, weights });
     }
+    if (optimizer) {
+        try {
+            const ws = await optimizer.getWeights();
+            const serialized: SerializedOptVar[] = [];
+            for (const nt of ws) {
+                serialized.push({
+                    name: nt.name,
+                    shape: nt.tensor.shape.slice(),
+                    data: Array.from(await nt.tensor.data() as Float32Array),
+                });
+            }
+            out.optimizerState = serialized;
+        } catch (err) {
+            console.warn('[model] failed to serialize optimizer state:', (err as Error).message);
+        }
+    }
     const fs = await import('fs');
-    // Atomic write: stage to .tmp then rename, so a crash mid-save can't truncate the
-    // existing checkpoint and lose hours of training.
+    // Atomic write: stage to .tmp + rename so a mid-save crash can't truncate the checkpoint.
     const tmp = path + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(out));
     fs.renameSync(tmp, path);
 }
 
-// Load weights and (optionally) training state from a checkpoint JSON into `model`.
-// Throws if the checkpoint's arch/dims don't match the freshly-built model — we'd
-// rather fail loudly than silently start from random weights when the user asked
-// to warm-start.
-export async function importWeights(model: tf.LayersModel, path: string): Promise<TrainingState | undefined> {
+export interface LoadResult {
+    trainingState?: TrainingState;
+    optimizerState?: SerializedOptVar[];
+}
+
+// Throws on arch/dim mismatch — silent random reinit would be worse than failing loudly.
+export async function importWeights(model: tf.LayersModel, path: string): Promise<LoadResult> {
     const fs = await import('fs');
     const raw = fs.readFileSync(path, 'utf8');
     const data = JSON.parse(raw) as SerializedModel;
-    if (data.arch !== 'cnn-v1') throw new Error(`incompatible arch: ${data.arch}`);
+    if (data.arch !== ARCH_TAG) throw new Error(`incompatible arch: ${data.arch} (expected ${ARCH_TAG})`);
     if (data.obsSize !== OBS_SIZE) throw new Error(`obsSize mismatch: checkpoint=${data.obsSize} model=${OBS_SIZE}`);
     if (data.numActions !== NUM_ACTIONS) throw new Error(`numActions mismatch: checkpoint=${data.numActions} model=${NUM_ACTIONS}`);
     if (data.boardH !== BOARD_H || data.boardW !== BOARD_W || data.numChannels !== NUM_CHANNELS || data.numScalars !== NUM_SCALARS) {
@@ -174,21 +203,30 @@ export async function importWeights(model: tf.LayersModel, path: string): Promis
         throw new Error(`architecture hyperparameter mismatch`);
     }
     for (const ld of data.layers) {
+        if (!LAYER_NAMES.includes(ld.name as typeof LAYER_NAMES[number])) continue;
         const layer = model.getLayer(ld.name);
         const tensors = ld.weights.map(w => tf.tensor(w.data, w.shape));
         layer.setWeights(tensors);
         tensors.forEach(t => t.dispose());
     }
-    return data.trainingState;
+    return { trainingState: data.trainingState, optimizerState: data.optimizerState };
 }
 
-// Copy weights from source to target without rebuilding (target net update).
-export function copyWeights(src: tf.LayersModel, dst: tf.LayersModel): void {
-    const sw = src.getWeights();
-    dst.setWeights(sw);
+// Must be called AFTER the first applyGradients (when Adam's slot variables exist).
+// Best-effort: on tfjs version-skew or slot-name shape mismatch, log and continue with fresh momentum.
+export async function applyOptimizerState(optimizer: tf.Optimizer, state: SerializedOptVar[]): Promise<boolean> {
+    try {
+        const named = state.map(s => ({ name: s.name, tensor: tf.tensor(s.data, s.shape) }));
+        await optimizer.setWeights(named);
+        named.forEach(n => n.tensor.dispose());
+        return true;
+    } catch (err) {
+        console.warn('[model] failed to apply optimizer state, continuing with fresh momentum:', (err as Error).message);
+        return false;
+    }
 }
 
-// Soft-update: dst ← τ·src + (1-τ)·dst. Smoother target tracking than hard copies.
+// dst ← τ·src + (1-τ)·dst.
 export function softUpdate(src: tf.LayersModel, dst: tf.LayersModel, tau: number): void {
     const sw = src.getWeights();
     const dw = dst.getWeights();
@@ -197,8 +235,7 @@ export function softUpdate(src: tf.LayersModel, dst: tf.LayersModel, tau: number
     next.forEach(t => t.dispose());
 }
 
-// Snapshot the model's current weights as a detached array (caller owns dispose).
-// Used by the opponent pool to keep frozen historical policies around.
+// Detached weight clone; caller owns dispose.
 export function snapshotWeights(model: tf.LayersModel): tf.Tensor[] {
     return model.getWeights().map(w => w.clone());
 }

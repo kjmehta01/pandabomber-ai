@@ -1,34 +1,26 @@
-// Pure-logic simulator for PandaBomber. Tracks production game.ts/gameplayer.ts as
-// closely as practical at a 10ms tick — matches production's 100Hz tickRate exactly.
-// The non-trivial timing pieces — explosion travel and per-cell kill windows — are
-// modeled explicitly; see ActiveExplosion.
+// Pure-logic MU simulator that tracks production game.ts / gameplayer.ts at 10ms
+// ticks (production's 100Hz tickRate). TT (time-trial) is out of scope — the bot is
+// only ever deployed in 4-player MU.
 //
-// Sim is MU-only. Time-trial (TT) game mechanics from production (deterministic
-// powerup rotation, wood-clearing win condition) are not modeled — the trained bot
-// is only ever used in 4-player MU matches.
-//
-// Exactly modeled:
+// Exactly modeled vs production:
 //   - bomb fuse (3000ms), invulnerability (200ms), knock duration (6000ms)
 //   - 3-strikes-same-cell ⇒ outright death (gameplayer.ts:70-84)
-//   - chain detonation: ray hitting a bomb chains synchronously, ray PASSES THROUGH
-//     the bomb's cell (production explodeBomb: no break after recursive chain call)
-//   - rays stop at stone / wood; wood absorbs the ray and is destroyed AT THE RAY'S
-//     ARRIVAL TIME (production recurseExecute), not at fuse-expiry
-//   - 25ms-per-cell explosion travel; per-cell death window = [arrival, arrival+50ms]
-//     (matches production's two checkPlayerDeaths calls per cell)
+//   - chain detonation: a ray hitting a bomb chains synchronously and PASSES
+//     THROUGH the bomb's cell (production explodeBomb has no break post-chain)
+//   - rays stop at stone/wood; wood is destroyed AT THE RAY'S ARRIVAL TIME, not
+//     at fuse-expiry (production recurseExecute)
+//   - 25ms/cell explosion travel; per-cell death window = [arrival, arrival+50ms]
+//     (production fires checkPlayerDeaths twice per cell)
 //   - powerup caps (13), MU spawn odds, death-drop spawn (4 in 5×5 around death)
 //   - corner spawn clearing (3 cells per corner are wood-free)
 //
-// Movement passability uses Math.round() of the target cell — exactly what the
-// authoritative server check does (gameplayer.ts:48-60 updatePos). The frontend's
-// ceil/floor logic with bombWalkingTolerance is client-side prediction for smooth
-// rendering of human input; it doesn't affect what the server accepts.
+// Movement passability uses Math.round() of the target — matches the authoritative
+// server check (gameplayer.ts:48-60). Frontend's ceil/floor + bombWalkingTolerance
+// is client-side smoothing and doesn't affect what the server accepts.
 //
-// Kill checks fire exactly twice per cell: once at first tick `now >= arrivalMs`,
-// once at first tick `now >= arrivalMs + 50ms`. After that the cell is permanently
-// safe (production: the two setTimeouts in recurseExecute have fired and there are
-// no more pending checks). Each "first tick past T" may be up to SIM_DT_MS=10ms late
-// vs production's exact-timer firing — that's our only timing-quantization error.
+// Only timing-quantization error: per-cell kill checks fire at the first tick
+// past arrivalMs / arrivalMs+50ms, which can be up to SIM_DT_MS=10ms late vs
+// production's exact setTimeout firings.
 
 export const BOARD_H = 13;
 export const BOARD_W = 19;
@@ -38,12 +30,12 @@ export const BOMB_FUSE_MS = 3000;
 export const KNOCK_DURATION_MS = 6000;
 export const INVULNERABILITY_MS = 200;
 export const MAX_POWERUPS = 13;
-export const EXPLOSION_TRAVEL_MS = 25; // matches game.ts:12
-export const DEATH_CHECK_WINDOW_MS = 50; // matches the second checkPlayerDeaths +50ms in executeExplosions/recurseExecute
+export const EXPLOSION_TRAVEL_MS = 25; // game.ts:12
+export const DEATH_CHECK_WINDOW_MS = 50; // 2nd checkPlayerDeaths is +50ms in recurseExecute
 
 const START_MOVE_SPEED = 0.045;
 const MOVE_SPEED_INCREMENT = 0.003;
-// Production: cells/frame = moveSpeed * 1.667; frames at 60Hz ⇒ cells/sec = moveSpeed*1.667*60.
+// Production: cells/frame = speed*1.667 at 60Hz ⇒ cells/ms = speed*1.667*60/1000.
 const CELLS_PER_MS = (speed: number) => speed * 1.667 * 60 / 1000;
 
 export type Cell = 'E' | 'S' | 'W' | 'B' | 'NUM' | 'SPE' | 'STR';
@@ -72,10 +64,10 @@ export interface SimPlayer {
     knockMsLeft: number;
     y: number;
     x: number;
-    // Sign of motion (-1, 0, 1). Magnitude comes from moveSpeed via CELLS_PER_MS.
+    // Sign of motion (-1, 0, 1); magnitude from moveSpeed via CELLS_PER_MS.
     dyDir: number;
     dxDir: number;
-    // Cell we're actively traveling toward; set at commit, cleared on arrival.
+    // Target cell while in transit; set at commit, cleared on arrival.
     moveTargetY: number;
     moveTargetX: number;
     pendingAction: Action;
@@ -88,27 +80,24 @@ export interface SimPlayer {
     numDies: number;
     firstDieTimeMs: number;
     rewardThisStep: number;
-    // Per-game counters surfaced by the eval harness. Not used during training, but
-    // updates are O(1) per event so the cost is negligible.
+    // Per-game counters for the eval harness; O(1) per event.
     stats: {
         bombsPlaced: number;
         woodDestroyed: number;
         powerupsCollected: number;
+        knocksScored: number;
         killsScored: number;
         diedFromOwnBomb: number;
     };
 }
 
-// One active explosion event. `cells` keys are "r,c" strings; each entry tracks when
-// the ray arrives and when its second kill check fires. We model production exactly:
-// two kill checks per cell, at arrival and arrival+50ms, then never again.
-//
-// If multiple rays reach the same cell (e.g. chains), we keep the EARLIEST arrival —
-// the first ray's two checks dominate the cell's danger window, and the production
-// kill-on-knock/200ms-invulnerability rule absorbs any extra firings from later rays.
+// One active explosion. `cells` keys are "r,c". Production fires two kill checks
+// per cell (at arrival and arrival+50ms), then the cell is permanently safe.
+// On collisions (chains hitting the same cell), the EARLIEST arrival wins —
+// invulnerability + 50ms windows make later rays redundant anyway.
 export interface ExplosionCell {
     arrivalMs: number;
-    secondCheckMs: number; // arrivalMs + DEATH_CHECK_WINDOW_MS
+    secondCheckMs: number;
     sourceOwnerIdx: number;
     firstFired: boolean;
     secondFired: boolean;
@@ -225,7 +214,7 @@ export class Sim {
                 moveSpeed: START_MOVE_SPEED, bombPower: 1, maxBombs: 1, placedBombs: 0,
                 lastDeathRow: -1, lastDeathCol: -1, numDies: 0, firstDieTimeMs: -1,
                 rewardThisStep: 0,
-                stats: { bombsPlaced: 0, woodDestroyed: 0, powerupsCollected: 0, killsScored: 0, diedFromOwnBomb: 0 },
+                stats: { bombsPlaced: 0, woodDestroyed: 0, powerupsCollected: 0, knocksScored: 0, killsScored: 0, diedFromOwnBomb: 0 },
             });
         }
         this.elapsedMs = 0;
@@ -247,8 +236,8 @@ export class Sim {
         return cell === 'E' || cell === 'B' || cell === 'NUM' || cell === 'SPE' || cell === 'STR';
     }
 
-    // True iff the player is at integer cell coords (within tolerance) — both the
-    // commit point AND the only point at which a new action can take effect.
+    // True iff the player is at integer cell coords — the only point where a new
+    // action can take effect.
     isAtCell(playerIdx: number): boolean {
         const p = this.players[playerIdx];
         return p.dyDir === 0 && p.dxDir === 0;
@@ -263,9 +252,9 @@ export class Sim {
     private commitActions() {
         for (const p of this.players) {
             if (!p.alive || p.knocked) continue;
-            if (p.dyDir !== 0 || p.dxDir !== 0) continue; // mid-cell; can't commit
+            if (p.dyDir !== 0 || p.dxDir !== 0) continue; // mid-cell
             const a = p.pendingAction;
-            p.pendingAction = ACTION_STAY; // consumed
+            p.pendingAction = ACTION_STAY;
             if (a === ACTION_STAY) continue;
             if (a === ACTION_BOMB) {
                 const r = Math.round(p.y);
@@ -342,9 +331,8 @@ export class Sim {
         }
     }
 
-    // Find all bombs that detonate together. Mirrors production explodeBomb's recursive
-    // chain: a ray that hits a bomb chains it (no break), but wood/stone stop the ray
-    // entirely, so they also stop the chain through that direction.
+    // Mirrors production explodeBomb's recursive chain: a ray hitting a bomb
+    // chains it (no break), but wood/stone stop the ray and so also stop the chain.
     private buildChain(root: Bomb): Bomb[] {
         const chain = new Set<Bomb>();
         chain.add(root);
@@ -357,22 +345,20 @@ export class Sim {
                     const c = b.col + dx * i;
                     if (r < 0 || r >= BOARD_H || c < 0 || c >= BOARD_W) break;
                     if (this.blocks[r][c] === 'S') break;
-                    if (this.blocks[r][c] === 'W') break; // wood blocks the chain
+                    if (this.blocks[r][c] === 'W') break;
                     const other = this.bombs[r][c];
                     if (other && !chain.has(other)) {
                         chain.add(other);
                         queue.push(other);
                     }
-                    // ray continues past empties / powerups / chained bombs
                 }
             }
         }
         return [...chain];
     }
 
-    // Compute per-cell arrival times across all centers, mark the resulting cells as
-    // an ActiveExplosion. Wood destruction and player damage are NOT done here — they
-    // happen in processActiveExplosions at the cell's arrival tick.
+    // Compute per-cell arrival times from all chain centers; wood destruction and
+    // kill checks happen later in processActiveExplosions at each cell's arrival tick.
     private createExplosion(centers: Bomb[]) {
         const cells = new Map<string, ExplosionCell>();
         const explodeAt = this.elapsedMs;
@@ -389,8 +375,7 @@ export class Sim {
                     secondFired: false,
                 });
             } else if (arrivalT < ex.arrivalMs) {
-                // Earlier ray wins: it owns the wood-destroy credit and bounds the
-                // first kill check.
+                // Earlier ray wins wood-destroy credit + bounds the first kill check.
                 ex.arrivalMs = arrivalT;
                 ex.secondCheckMs = arrivalT + DEATH_CHECK_WINDOW_MS;
                 ex.sourceOwnerIdx = owner;
@@ -407,7 +392,7 @@ export class Sim {
                     if (this.blocks[r][c] === 'S') break;
                     const arrivalT = explodeAt + i * EXPLOSION_TRAVEL_MS;
                     upsert(r, c, arrivalT, b.ownerIdx);
-                    if (this.blocks[r][c] === 'W') break; // wood absorbs and ends ray
+                    if (this.blocks[r][c] === 'W') break;
                 }
             }
         }
@@ -429,20 +414,20 @@ export class Sim {
                 if (cell.firstFired && cell.secondFired) continue;
                 const [r, c] = key.split(',').map(Number);
 
-                // First check: destroy wood + kill check at arrival (or first tick past it).
+                // First check at arrival: destroy wood + kill check.
                 if (!cell.firstFired && now >= cell.arrivalMs) {
                     cell.firstFired = true;
                     if (this.blocks[r][c] === 'W') {
                         this.blocks[r][c] = undefined;
                         this.woodLeft--;
-                        this.players[cell.sourceOwnerIdx].rewardThisStep += 0.2;
+                        this.players[cell.sourceOwnerIdx].rewardThisStep += 1.0;
                         this.players[cell.sourceOwnerIdx].stats.woodDestroyed++;
                         this.maybeSpawnPowerup(r, c);
                     }
                     this.killCheck(r, c, cell.sourceOwnerIdx);
                 }
 
-                // Second check: kill check at arrival+50ms (or first tick past it).
+                // Second kill check at arrival+50ms.
                 if (cell.firstFired && !cell.secondFired && now >= cell.secondCheckMs) {
                     cell.secondFired = true;
                     this.killCheck(r, c, cell.sourceOwnerIdx);
@@ -450,8 +435,7 @@ export class Sim {
 
                 if (!cell.firstFired || !cell.secondFired) anyUnfired = true;
             }
-            // Prune once every cell has fired both checks — production stops checking
-            // a cell forever after its +50ms timeout fires.
+            // Production stops checking a cell forever after the +50ms timer fires.
             if (anyUnfired) stillActive.push(exp);
         }
         this.activeExplosions = stillActive;
@@ -477,7 +461,7 @@ export class Sim {
         if (!p.knocked) {
             p.knocked = true;
             p.knockMsLeft = KNOCK_DURATION_MS;
-            p.dyDir = 0; p.dxDir = 0; // freeze in place per production
+            p.dyDir = 0; p.dxDir = 0; // production freezes knocked players
             if (row === p.lastDeathRow && col === p.lastDeathCol && this.elapsedMs - p.firstDieTimeMs < 19_000) {
                 if (p.numDies === 2) {
                     this.kill(p, attacker);
@@ -490,7 +474,10 @@ export class Sim {
                 p.numDies = 1;
                 p.firstDieTimeMs = this.elapsedMs;
             }
-            if (attacker !== p) attacker.rewardThisStep += 5.0;
+            if (attacker !== p) {
+                attacker.rewardThisStep += 5.0;
+                attacker.stats.knocksScored++;
+            }
             p.rewardThisStep -= 10.0;
         } else {
             this.kill(p, attacker);
@@ -587,9 +574,8 @@ export class Sim {
             return true;
         }
         if (this.elapsedMs >= this.cfg.maxTimeMs) {
-            // Stalemate: penalize every player still alive at timeout. Without this,
-            // mutual avoidance is a viable strategy — the per-step penalty alone
-            // doesn't deter two scared bots from both surviving to the clock.
+            // Penalize timeout survivors — without this, mutual avoidance becomes
+            // viable and the per-step penalty alone doesn't break the stalemate.
             for (const p of this.players) {
                 if (p.alive) {
                     p.rewardThisStep -= 15.0;
@@ -605,31 +591,19 @@ export class Sim {
         for (const p of this.players) p.rewardThisStep = 0;
         if (this.done) return { rewards: this.players.map(() => 0), done: true };
 
-        // 1) Commit pending actions for cell-aligned players.
         this.commitActions();
-
-        // 2) Move (continuous toward target cell).
         this.movePlayers(SIM_DT_MS);
-
-        // 3) Tick bomb fuses; detonate those that just expired (chained synchronously).
         this.advanceBombs(SIM_DT_MS);
-
-        // 4) Advance time BEFORE processing activations, so a brand-new explosion
-        //    whose center arrives at elapsedMs gets its arrival event this tick.
+        // Advance time BEFORE processing explosions so a same-tick brand-new
+        // explosion's center fires its arrival event this tick.
         this.elapsedMs += SIM_DT_MS;
-
-        // 5) Process active explosions: wood destruction + kill checks at arrival
-        //    and again at end-of-window.
         this.processActiveExplosions();
-
-        // 6) Collect powerups (after possible new ones spawned from destroyed wood).
+        // Collect after explosions so powerups spawned from this tick's wood are pickable.
         this.collectPowerups();
-
-        // 7) Timers.
         this.updateTimers(SIM_DT_MS);
 
-        // 8) Per-step survival penalty so STAY isn't always the safest pick.
-        for (const p of this.players) if (p.alive) p.rewardThisStep -= 0.008;
+        // Per-step survival penalty so STAY isn't the universally safest pick.
+        for (const p of this.players) if (p.alive) p.rewardThisStep -= 0.003;
 
         this.done = this.gameOver();
         return { rewards: this.players.map(p => p.rewardThisStep), done: this.done };
