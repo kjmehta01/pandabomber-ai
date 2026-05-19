@@ -1,4 +1,4 @@
-// Dueling-DQN: two 3×3 conv layers (32 filters each) over the 13×19×11 spatial
+// Dueling-DQN: two 3×3 conv layers (32 filters each) over the 13×19×NUM_CHANNELS spatial
 // input, scalars concatenated into a 64-unit dense head, then split into value (1)
 // and advantage (NUM_ACTIONS) streams combined as Q = V + (A − mean A).
 //

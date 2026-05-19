@@ -71,11 +71,12 @@ function parseArgs(): Args {
         batchSize: 128,
         gamma: 0.99,
         learnEvery: 8,
-        // Decisions are cell-aligned (~17 ticks apart); bomb fuse is 300 ticks
-        // (~18 decisions) plus ray travel. n=20 ≈ 340 ticks keeps the place-bomb
-        // decision in-queue until its explosion fires, so wood/kill reward flows
-        // back to it via the n-step return.
-        nStep: 20,
+        // Decisions are cell-aligned (~12–22 ticks apart, faster as moveSpeed
+        // grows); bomb fuse is 300 ticks plus ray travel. n=30 covers the fuse
+        // even at max speed (~12 ticks/decision → 360 ticks for n=30), so the
+        // place-bomb decision stays in-queue until its explosion fires and the
+        // wood/kill/knock reward propagates via the n-step return.
+        nStep: 30,
         targetTau: 0.005,
         epsStart: 1.0,
         epsEnd: 0.05,
@@ -197,6 +198,7 @@ class EpisodeStats {
     private rows: {
         learnerWon: number; stalemate: number; learnerAlive: number;
         woodLearner: number; killsLearner: number; deathsLearner: number; knocksScoredLearner: number;
+        knocksReceivedLearner: number; illegalMovesLearner: number; illegalBombsLearner: number;
         powerupsLearner: number; ownBombLearner: number; bombsLearner: number;
         rewardLearner: number; rewardOpp: number;
         steps: number; numPlayers: number;
@@ -222,6 +224,9 @@ class EpisodeStats {
             kills: avg(r => r.killsLearner),
             deaths: avg(r => r.deathsLearner),
             knocks: avg(r => r.knocksScoredLearner),
+            knocksReceived: avg(r => r.knocksReceivedLearner),
+            illegalMoves: avg(r => r.illegalMovesLearner),
+            illegalBombs: avg(r => r.illegalBombsLearner),
             powerups: avg(r => r.powerupsLearner),
             ownBomb: avg(r => r.ownBombLearner),
             bombs: avg(r => r.bombsLearner),
@@ -321,6 +326,8 @@ async function train() {
         const stepQueue: StepEntry[][] = Array.from({ length: numPlayers }, () => []);
         const pendingReward = new Float32Array(numPlayers);
         const totalReward = new Float32Array(numPlayers);
+        // Histogram of actions chosen by the learner this episode; index by Action enum.
+        const learnerActionHist = new Int32Array(NUM_ACTIONS);
         let done = false;
         let stepInGame = 0;
         // Safety margin past the 60s @ 10ms = 6000 tick cap.
@@ -353,6 +360,7 @@ async function train() {
                 }
                 const a = pickAction(qValues.get(i)!, i === 0 ? eps : args.epsOpponent);
                 actions.push(a);
+                if (i === 0) learnerActionHist[a]++;
 
                 // Off-policy: opponent transitions are valid training data too.
                 const q_i = stepQueue[i];
@@ -489,6 +497,9 @@ async function train() {
             killsLearner: ls.killsScored,
             deathsLearner: learnerPlayer.alive ? 0 : 1,
             knocksScoredLearner: ls.knocksScored,
+            knocksReceivedLearner: ls.knocksReceived,
+            illegalMovesLearner: ls.illegalMoves,
+            illegalBombsLearner: ls.illegalBombs,
             powerupsLearner: ls.powerupsCollected,
             ownBombLearner: ls.diedFromOwnBomb,
             bombsLearner: ls.bombsPlaced,
@@ -502,10 +513,16 @@ async function train() {
         const learnLine = learnCount > 0
             ? ` learn[n=${learnCount}]: loss=${(learnLossAcc / lc).toExponential(2)} |td|=${(learnTdAcc / lc).toFixed(3)} q=${(learnQAcc / lc).toFixed(3)} gradNorm=${(learnGradAcc / lc).toFixed(3)}`
             : ' learn[n=0]';
+        // Action histogram: STAY,UP,DOWN,LEFT,RIGHT,BOMB → s/u/d/l/r/b.
+        const totalActs = Math.max(1, Array.from(learnerActionHist).reduce((a, b) => a + b, 0));
+        const actPct = (n: number) => Math.round((n / totalActs) * 100).toString().padStart(2);
+        const actHist = `s/u/d/l/r/b=${actPct(learnerActionHist[0])}/${actPct(learnerActionHist[1])}/${actPct(learnerActionHist[2])}/${actPct(learnerActionHist[3])}/${actPct(learnerActionHist[4])}/${actPct(learnerActionHist[5])}`;
         console.log(
             `[train] ep=${ep} step=${globalStep} eps=${epsilon(globalStep, args).toFixed(3)} ` +
             `np=${numPlayers} rLearner=${totalReward[0].toFixed(2)} rOpp=${oppRewardMean.toFixed(2)} ` +
-            `wood=${ls.woodDestroyed} kills=${ls.killsScored} alive=${learnerPlayer.alive ? 1 : 0} ` +
+            `wood=${ls.woodDestroyed} kills=${ls.killsScored} kRcv=${ls.knocksReceived} ` +
+            `illM=${ls.illegalMoves} illB=${ls.illegalBombs} alive=${learnerPlayer.alive ? 1 : 0} ` +
+            `act[${actHist}] ` +
             `bufSize=${buffer.size} opps=${opponentSources.slice(1).join(',')} pool=${pool.size()}/${args.poolSize} (pPool=${poolOppCount})` +
             learnLine
         );
@@ -516,8 +533,10 @@ async function train() {
             console.log(
                 `[summary] ep=${ep + 1} last${s.n}: winRate=${(s.winRate * 100).toFixed(1)}% ` +
                 `stalemate=${(s.stalemateRate * 100).toFixed(1)}% survive=${(s.survivalRate * 100).toFixed(1)}% ` +
-                `wood=${s.wood.toFixed(1)} kills=${s.kills.toFixed(2)} knocks=${s.knocks.toFixed(2)} deaths=${s.deaths.toFixed(2)} ` +
-                `ownBomb=${s.ownBomb.toFixed(2)} bombs=${s.bombs.toFixed(1)} powerups=${s.powerups.toFixed(1)} ` +
+                `wood=${s.wood.toFixed(1)} kills=${s.kills.toFixed(2)} knocks=${s.knocks.toFixed(2)} ` +
+                `kRcv=${s.knocksReceived.toFixed(2)} deaths=${s.deaths.toFixed(2)} ownBomb=${s.ownBomb.toFixed(2)} ` +
+                `illM=${s.illegalMoves.toFixed(0)} illB=${s.illegalBombs.toFixed(0)} ` +
+                `bombs=${s.bombs.toFixed(1)} powerups=${s.powerups.toFixed(1)} ` +
                 `rLearner=${s.rLearner.toFixed(2)} rOpp=${s.rOpp.toFixed(2)} steps=${s.steps.toFixed(0)}`
             );
         }

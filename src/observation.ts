@@ -11,11 +11,14 @@ export const BOARD_W = 19;
 // Spatial channels:
 //   0  stone               1  wood                2  bomb present
 //   3  bomb fuse (1=just placed, 0=about to explode)
-//   4  time-to-blast (1=exploding now, 0=>=DANGER_LOOKAHEAD_MS away)
+//   4  time-to-blast (1=exploding now, 0=>=DANGER_LOOKAHEAD_MS away);
+//      includes chain-triggered earlier detonation times
 //   5  powerup NUM         6  powerup SPE         7  powerup STR
 //   8  self position       9  enemy positions
 //  10  knocked enemies: knockMsLeft/KNOCK_DURATION_MS (1=just knocked, 0=recovering now)
-export const NUM_CHANNELS = 11;
+//  11  active blast cells: msUntilSafe/ACTIVE_BLAST_DANGER_MS — a bomb that already
+//      detonated is still lethal for up to ~300ms (per-cell arrival + 50ms second-check)
+export const NUM_CHANNELS = 12;
 // Scalars (all normalized): bombPower/13, maxBombs/13, moveSpeed tier/13,
 // placedBombs/maxBombs, woodLeft/100, game phase (0=lots of walls, 1=none).
 export const NUM_SCALARS = 6;
@@ -33,6 +36,10 @@ const MOVE_SPEED_INCREMENT = 0.003;
 // Matches sim.ts and production game.ts:12. A power=10 bomb's far end is +250ms
 // past center — material to the agent's dodge plan.
 const EXPLOSION_TRAVEL_MS = 25;
+// Far end of a power-10 bomb's kill window: 250ms travel + 50ms second-check.
+const ACTIVE_BLAST_DANGER_MS = 300;
+
+const DIRS: Array<[number, number]> = [[-1, 0], [1, 0], [0, -1], [0, 1]];
 
 // Minimal interface so this module doesn't depend on Sim; bot2.ts builds its own
 // SimView from network state.
@@ -43,6 +50,9 @@ export interface ObsView {
     bombs: Array<{ row: number; col: number; power: number; fuseRemainingMs: number }>;
     self: { y: number; x: number; bombPower: number; maxBombs: number; moveSpeed: number; placedBombs: number };
     enemies: Array<{ y: number; x: number; alive: boolean; knocked: boolean; knockMsLeft: number }>;
+    // Cells currently inside a detonated-bomb kill window; msUntilSafe is the time
+    // until the cell's second kill-check fires.
+    activeBlasts: Array<{ row: number; col: number; msUntilSafe: number }>;
     woodLeft: number;
 }
 
@@ -51,30 +61,71 @@ function idx(r: number, x: number, c: number): number {
     return r * BOARD_W * NUM_CHANNELS + x * NUM_CHANNELS + c;
 }
 
-// Min ms until each cell gets blasted by some pending bomb. Distance-i along a ray
-// arrives at fuseRemainingMs + i*25ms. Chain reactions can only LOWER this, so the
-// value is a safe lower bound for dodge planning.
+// Min ms until each cell gets blasted by some pending bomb, accounting for chain
+// detonation: bomb A's ray reaching bomb B forces B to detonate at A's arrival
+// time. Iterate until effective fuses stabilize (bounded by bomb count).
 function computeBlastTimes(view: ObsView): Float32Array {
     const out = new Float32Array(view.boardH * view.boardW);
     out.fill(Infinity);
-    for (const b of view.bombs) {
+    if (view.bombs.length === 0) return out;
+
+    // Effective fuse per bomb after chain propagation.
+    const fuses: number[] = view.bombs.map(b => b.fuseRemainingMs);
+    // Quick lookup of bomb index by cell.
+    const bombAt = new Map<number, number>();
+    for (let i = 0; i < view.bombs.length; i++) {
+        bombAt.set(view.bombs[i].row * view.boardW + view.bombs[i].col, i);
+    }
+
+    let changed = true;
+    let iter = 0;
+    const maxIter = view.bombs.length + 1;
+    while (changed && iter++ < maxIter) {
+        changed = false;
+        for (let bi = 0; bi < view.bombs.length; bi++) {
+            const b = view.bombs[bi];
+            const bombFuse = fuses[bi];
+            for (const [dy, dx] of DIRS) {
+                for (let i = 1; i <= b.power; i++) {
+                    const r = b.row + dy * i;
+                    const c = b.col + dx * i;
+                    if (r < 0 || r >= view.boardH || c < 0 || c >= view.boardW) break;
+                    const cell = view.getCell(r, c);
+                    if (cell === 'S') break;
+                    const otherIdx = bombAt.get(r * view.boardW + c);
+                    if (otherIdx !== undefined) {
+                        const trigger = bombFuse + i * EXPLOSION_TRAVEL_MS;
+                        if (trigger < fuses[otherIdx]) {
+                            fuses[otherIdx] = trigger;
+                            changed = true;
+                        }
+                    }
+                    if (cell === 'W') break;
+                }
+            }
+        }
+    }
+
+    // Paint blast times using effective fuses.
+    for (let bi = 0; bi < view.bombs.length; bi++) {
+        const b = view.bombs[bi];
+        const fuse = fuses[bi];
         const mark = (r: number, c: number, t: number) => {
             const k = r * view.boardW + c;
             if (t < out[k]) out[k] = t;
         };
-        mark(b.row, b.col, b.fuseRemainingMs);
-        const tryDir = (dy: number, dx: number) => {
+        mark(b.row, b.col, fuse);
+        for (const [dy, dx] of DIRS) {
             for (let i = 1; i <= b.power; i++) {
                 const r = b.row + dy * i;
                 const c = b.col + dx * i;
                 if (r < 0 || r >= view.boardH || c < 0 || c >= view.boardW) break;
                 const cell = view.getCell(r, c);
                 if (cell === 'S') break;
-                mark(r, c, b.fuseRemainingMs + i * EXPLOSION_TRAVEL_MS);
+                mark(r, c, fuse + i * EXPLOSION_TRAVEL_MS);
                 if (cell === 'W') break;
             }
-        };
-        tryDir(-1, 0); tryDir(1, 0); tryDir(0, -1); tryDir(0, 1);
+        }
     }
     return out;
 }
@@ -120,6 +171,14 @@ export function encode(view: ObsView): Float32Array {
         } else {
             out[idx(er, ex, 9)] = 1;
         }
+    }
+
+    for (const ab of view.activeBlasts) {
+        if (ab.row < 0 || ab.row >= view.boardH || ab.col < 0 || ab.col >= view.boardW) continue;
+        const v = Math.max(0, Math.min(1, ab.msUntilSafe / ACTIVE_BLAST_DANGER_MS));
+        // Multiple overlapping explosions on the same cell → keep the larger danger.
+        const cur = out[idx(ab.row, ab.col, 11)];
+        if (v > cur) out[idx(ab.row, ab.col, 11)] = v;
     }
 
     const off = OBS_SPATIAL_SIZE;

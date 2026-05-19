@@ -27,6 +27,15 @@ export class Env {
                 if (b) bombsFlat.push(b);
             }
         }
+        const activeBlasts: Array<{ row: number; col: number; msUntilSafe: number }> = [];
+        for (const exp of this.sim.activeExplosions) {
+            for (const [key, cell] of exp.cells) {
+                if (cell.secondFired) continue;
+                const [r, c] = key.split(',').map(Number);
+                const msUntilSafe = Math.max(0, cell.secondCheckMs - this.sim.elapsedMs);
+                activeBlasts.push({ row: r, col: c, msUntilSafe });
+            }
+        }
         return {
             boardH: BOARD_H,
             boardW: BOARD_W,
@@ -40,6 +49,7 @@ export class Env {
             enemies: this.sim.players
                 .filter(p => p.idx !== playerIdx)
                 .map(p => ({ y: p.y, x: p.x, alive: p.alive, knocked: p.knocked, knockMsLeft: p.knockMsLeft })),
+            activeBlasts,
             woodLeft: this.sim.woodLeft,
         };
     }

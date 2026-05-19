@@ -118,16 +118,29 @@ interface MatchAggregate {
     suicideRate: number;
 }
 
-function runMatch(primary: Agent, opponent: Agent, games: number, baseSeed: number): MatchAggregate {
+// 4-player matchup: primary fills one seat, baseline fills the other 3. Each
+// baseline seat is an INDEPENDENT instance so randomly-seeded baselines don't
+// share state, and rotation of primary's seat over `games` cancels corner bias.
+function runMatch(primary: Agent, makeOpponent: (seatHash: number) => Agent, opponentName: string, games: number, baseSeed: number, numPlayers: number): MatchAggregate {
     const agg: MatchAggregate = {
-        primary: primary.name, opponent: opponent.name, games,
+        primary: primary.name, opponent: opponentName, games,
         primaryWins: 0, opponentWins: 0, draws: 0,
         avgDurationMs: 0, avgWoodDestroyed: 0, avgPowerupsCollected: 0,
         avgBombsPlaced: 0, avgKillsScored: 0, suicideRate: 0,
     };
+    const opponentInstances: Agent[] = [];
     for (let g = 0; g < games; g++) {
-        const primarySeat = g % 2;
-        const agents = primarySeat === 0 ? [primary, opponent] : [opponent, primary];
+        const primarySeat = g % numPlayers;
+        const agents: Agent[] = [];
+        for (let i = 0; i < numPlayers; i++) {
+            if (i === primarySeat) {
+                agents.push(primary);
+            } else {
+                const op = makeOpponent(baseSeed * 7919 + g * numPlayers + i);
+                opponentInstances.push(op);
+                agents.push(op);
+            }
+        }
         const result = runGame(agents, baseSeed + g);
         const primaryStats = result.stats[primarySeat];
 
@@ -148,6 +161,7 @@ function runMatch(primary: Agent, opponent: Agent, games: number, baseSeed: numb
     agg.avgBombsPlaced /= games;
     agg.avgKillsScored /= games;
     agg.suicideRate /= games;
+    for (const op of opponentInstances) op.dispose?.();
     return agg;
 }
 
@@ -156,6 +170,7 @@ interface Args {
     vs: string;        // comma-separated baselines
     games: number;
     seed: number;
+    players: number;   // 2 or 4; primary fills one seat, baseline fills the rest
     json: string;      // optional output path
 }
 
@@ -165,6 +180,7 @@ function parseArgs(): Args {
         vs: 'noop,random',
         games: 100,
         seed: 1000,
+        players: 4,
         json: '',
     };
     for (const arg of process.argv.slice(2)) {
@@ -179,10 +195,16 @@ function parseArgs(): Args {
     return a;
 }
 
-async function buildOpponent(spec: string, gameOffset: number): Promise<Agent> {
-    if (spec === 'noop') return makeNoopAgent();
-    if (spec === 'random') return makeRandomAgent(gameOffset);
-    if (spec.startsWith('model:')) return makeModelAgent(spec.slice('model:'.length), spec);
+// Returns a factory so each opponent SEAT gets its own agent instance — that
+// matters for random (independent seeds per seat) and lets model agents be
+// shared (no need to reload weights per seat).
+async function buildOpponentFactory(spec: string): Promise<{ name: string; make: (seatHash: number) => Agent; disposeShared?: () => void }> {
+    if (spec === 'noop') return { name: 'noop', make: () => makeNoopAgent() };
+    if (spec === 'random') return { name: 'random', make: (seatHash) => makeRandomAgent(seatHash) };
+    if (spec.startsWith('model:')) {
+        const shared = await makeModelAgent(spec.slice('model:'.length), spec);
+        return { name: spec, make: () => shared, disposeShared: () => shared.dispose?.() };
+    }
     throw new Error(`unknown opponent spec: ${spec} (expected noop|random|model:path)`);
 }
 
@@ -195,7 +217,7 @@ function fmt(x: number, w: number = 6): string {
 
 function printReport(args: Args, primaryName: string, matches: MatchAggregate[]) {
     console.log('');
-    console.log(`=== eval: ${primaryName} (${args.games} games per matchup, base seed ${args.seed}) ===`);
+    console.log(`=== eval: ${primaryName} (${args.games} games per matchup, ${args.players}-player, base seed ${args.seed}) ===`);
     console.log('');
     const header = ['opponent', 'wins', 'losses', 'draws', 'win_rate', 'avg_dur_s', 'avg_wood', 'avg_pups', 'avg_kills', 'suicide%'];
     console.log(header.map(h => h.padStart(11)).join(' '));
@@ -225,18 +247,22 @@ async function main() {
     const primary = await makeModelAgent(args.model, `model[${args.model}]`);
     const opponentSpecs = args.vs.split(',').map(s => s.trim()).filter(Boolean);
 
+    if (args.players < 2 || args.players > 4) {
+        throw new Error(`--players must be 2, 3, or 4 (got ${args.players})`);
+    }
+
     const matches: MatchAggregate[] = [];
     for (const spec of opponentSpecs) {
         // Distinct seed per matchup so the random agent doesn't replay the same
         // move sequence in every matchup.
         const seedOffset = matches.length * args.games * 7;
-        const opponent = await buildOpponent(spec, args.seed + seedOffset);
+        const factory = await buildOpponentFactory(spec);
         const t0 = Date.now();
-        const agg = runMatch(primary, opponent, args.games, args.seed + seedOffset);
+        const agg = runMatch(primary, factory.make, factory.name, args.games, args.seed + seedOffset, args.players);
         const t1 = Date.now();
         console.log(`[eval] ${spec}: ${agg.primaryWins}/${args.games} wins (${pct(agg.primaryWins / agg.games)}) in ${((t1 - t0) / 1000).toFixed(1)}s`);
         matches.push(agg);
-        opponent.dispose?.();
+        factory.disposeShared?.();
     }
     primary.dispose?.();
 

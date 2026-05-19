@@ -35,8 +35,26 @@ export const DEATH_CHECK_WINDOW_MS = 50; // 2nd checkPlayerDeaths is +50ms in re
 
 // Per-attempt penalty for actions the sim rejects: moving into stone/wood/bomb/oob,
 // or placing a bomb when slot is full / cell is occupied. Small relative to the
-// knock/kill rewards (~0.5–3.0) so it nudges without dominating learning.
+// knock/kill rewards so it nudges without dominating learning.
 const ILLEGAL_ACTION_PENALTY = 0.02;
+
+// Reward weights. Kill > knock > wood ordering chosen so engagement dominates
+// wood-farming when both are available.
+const REWARD_WOOD = 0.1;
+const REWARD_POWERUP = 0.05;
+const REWARD_KNOCK_SCORED = 1.0;
+const REWARD_KNOCK_RECEIVED = -1.0;
+const REWARD_KILL_SCORED = 6.0;
+const REWARD_DEATH = -1.5;
+const REWARD_LAST_ALIVE = 6.0;
+const REWARD_TIMEOUT_SURVIVOR = -1.5;
+const REWARD_PER_TICK_ALIVE = -0.0003;
+
+// Small per-tick shaping: when an alive enemy is within PROXIMITY_RADIUS manhattan
+// cells, encourage engagement. Cap at ~+0.6/episode (max 6000 ticks × 0.0001)
+// so it can't outweigh a kill but is enough to break a mutual-avoidance basin.
+const PROXIMITY_RADIUS = 4;
+const REWARD_PROXIMITY_PER_TICK = 0.0001;
 
 const START_MOVE_SPEED = 0.045;
 const MOVE_SPEED_INCREMENT = 0.003;
@@ -93,6 +111,9 @@ export interface SimPlayer {
         knocksScored: number;
         killsScored: number;
         diedFromOwnBomb: number;
+        illegalMoves: number;
+        illegalBombs: number;
+        knocksReceived: number;
     };
 }
 
@@ -219,7 +240,7 @@ export class Sim {
                 moveSpeed: START_MOVE_SPEED, bombPower: 1, maxBombs: 1, placedBombs: 0,
                 lastDeathRow: -1, lastDeathCol: -1, numDies: 0, firstDieTimeMs: -1,
                 rewardThisStep: 0,
-                stats: { bombsPlaced: 0, woodDestroyed: 0, powerupsCollected: 0, knocksScored: 0, killsScored: 0, diedFromOwnBomb: 0 },
+                stats: { bombsPlaced: 0, woodDestroyed: 0, powerupsCollected: 0, knocksScored: 0, killsScored: 0, diedFromOwnBomb: 0, illegalMoves: 0, illegalBombs: 0, knocksReceived: 0 },
             });
         }
         this.elapsedMs = 0;
@@ -276,6 +297,7 @@ export class Sim {
             // outright illegal, and walking onto a bomb traps the agent on top of a fuse.
             if (target === 'S' || target === 'W' || target === 'B') {
                 p.rewardThisStep -= ILLEGAL_ACTION_PENALTY;
+                p.stats.illegalMoves++;
                 continue;
             }
             p.moveTargetY = tr;
@@ -288,6 +310,7 @@ export class Sim {
     private placeBomb(p: SimPlayer, r: number, c: number) {
         if (p.placedBombs >= p.maxBombs || this.bombs[r][c] || this.blocks[r][c]) {
             p.rewardThisStep -= ILLEGAL_ACTION_PENALTY;
+            p.stats.illegalBombs++;
             return;
         }
         this.bombs[r][c] = { row: r, col: c, power: p.bombPower, fuseRemainingMs: BOMB_FUSE_MS, ownerIdx: p.idx };
@@ -432,7 +455,7 @@ export class Sim {
                     if (this.blocks[r][c] === 'W') {
                         this.blocks[r][c] = undefined;
                         this.woodLeft--;
-                        this.players[cell.sourceOwnerIdx].rewardThisStep += 0.3;
+                        this.players[cell.sourceOwnerIdx].rewardThisStep += REWARD_WOOD;
                         this.players[cell.sourceOwnerIdx].stats.woodDestroyed++;
                         this.maybeSpawnPowerup(r, c);
                     }
@@ -487,10 +510,11 @@ export class Sim {
                 p.firstDieTimeMs = this.elapsedMs;
             }
             if (attacker !== p) {
-                attacker.rewardThisStep += 0.5;
+                attacker.rewardThisStep += REWARD_KNOCK_SCORED;
                 attacker.stats.knocksScored++;
             }
-            p.rewardThisStep -= 1.0;
+            p.rewardThisStep += REWARD_KNOCK_RECEIVED;
+            p.stats.knocksReceived++;
         } else {
             this.kill(p, attacker);
         }
@@ -502,12 +526,12 @@ export class Sim {
         p.dyDir = 0; p.dxDir = 0;
         if (!this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
         if (attacker !== p) {
-            attacker.rewardThisStep += 3.0;
+            attacker.rewardThisStep += REWARD_KILL_SCORED;
             attacker.stats.killsScored++;
         } else {
             p.stats.diedFromOwnBomb = 1;
         }
-        p.rewardThisStep -= 1.5;
+        p.rewardThisStep += REWARD_DEATH;
 
         const numDrop = 4;
         const spots: [number, number][] = [];
@@ -559,7 +583,7 @@ export class Sim {
                 const tier = Math.round((p.moveSpeed - START_MOVE_SPEED) / MOVE_SPEED_INCREMENT) + 1;
                 if (tier < MAX_POWERUPS) p.moveSpeed += MOVE_SPEED_INCREMENT;
             }
-            p.rewardThisStep += 0.05;
+            p.rewardThisStep += REWARD_POWERUP;
             p.stats.powerupsCollected++;
         }
     }
@@ -582,7 +606,7 @@ export class Sim {
         if (alive.length === 0) return true;
         if (alive.length === 1 && this.cfg.numPlayers > 1) {
             if (!this.ranking.includes(alive[0].idx)) this.ranking.unshift(alive[0].idx);
-            alive[0].rewardThisStep += 3.0;
+            alive[0].rewardThisStep += REWARD_LAST_ALIVE;
             return true;
         }
         if (this.elapsedMs >= this.cfg.maxTimeMs) {
@@ -590,7 +614,7 @@ export class Sim {
             // viable and the per-step penalty alone doesn't break the stalemate.
             for (const p of this.players) {
                 if (p.alive) {
-                    p.rewardThisStep -= 1.5;
+                    p.rewardThisStep += REWARD_TIMEOUT_SURVIVOR;
                     if (!this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
                 }
             }
@@ -615,7 +639,23 @@ export class Sim {
         this.updateTimers(SIM_DT_MS);
 
         // Per-step survival penalty so STAY isn't the universally safest pick.
-        for (const p of this.players) if (p.alive) p.rewardThisStep -= 0.0003;
+        for (const p of this.players) if (p.alive) p.rewardThisStep += REWARD_PER_TICK_ALIVE;
+
+        // Engagement shaping: small per-tick reward when an alive enemy is within
+        // PROXIMITY_RADIUS manhattan cells. Breaks the mutual-avoidance basin by
+        // giving a tiny positive gradient toward "be near opponents."
+        for (const p of this.players) {
+            if (!p.alive) continue;
+            const py = Math.round(p.y), px = Math.round(p.x);
+            for (const other of this.players) {
+                if (other === p || !other.alive || other.knocked) continue;
+                const d = Math.abs(py - Math.round(other.y)) + Math.abs(px - Math.round(other.x));
+                if (d <= PROXIMITY_RADIUS) {
+                    p.rewardThisStep += REWARD_PROXIMITY_PER_TICK;
+                    break;
+                }
+            }
+        }
 
         this.done = this.gameOver();
         return { rewards: this.players.map(p => p.rewardThisStep), done: this.done };
