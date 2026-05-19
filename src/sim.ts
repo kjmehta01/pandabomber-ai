@@ -36,7 +36,7 @@ export const DEATH_CHECK_WINDOW_MS = 50; // 2nd checkPlayerDeaths is +50ms in re
 // Per-attempt penalty for actions the sim rejects: moving into stone/wood/bomb/oob,
 // or placing a bomb when slot is full / cell is occupied. Small relative to the
 // knock/kill rewards so it nudges without dominating learning.
-const ILLEGAL_ACTION_PENALTY = 0.02;
+const ILLEGAL_ACTION_PENALTY = 0.1;
 
 // Reward weights. Kill > knock > wood ordering chosen so engagement dominates
 // wood-farming when both are available.
@@ -48,13 +48,7 @@ const REWARD_KILL_SCORED = 6.0;
 const REWARD_DEATH = -1.5;
 const REWARD_LAST_ALIVE = 6.0;
 const REWARD_TIMEOUT_SURVIVOR = -1.5;
-const REWARD_PER_TICK_ALIVE = -0.0003;
-
-// Small per-tick shaping: when an alive enemy is within PROXIMITY_RADIUS manhattan
-// cells, encourage engagement. Cap at ~+0.6/episode (max 6000 ticks × 0.0001)
-// so it can't outweigh a kill but is enough to break a mutual-avoidance basin.
-const PROXIMITY_RADIUS = 4;
-const REWARD_PROXIMITY_PER_TICK = 0.0001;
+const REWARD_PER_TICK_ALIVE = -0.001;
 
 const START_MOVE_SPEED = 0.045;
 const MOVE_SPEED_INCREMENT = 0.003;
@@ -114,6 +108,20 @@ export interface SimPlayer {
         illegalMoves: number;
         illegalBombs: number;
         knocksReceived: number;
+        // Episode-cumulative reward broken down by source. Sums to totalReward.
+        // Useful to diagnose which incentives are dominating the policy.
+        rewardBreakdown: {
+            wood: number;
+            powerup: number;
+            knockScored: number;
+            knockReceived: number;
+            killScored: number;
+            death: number;
+            lastAlive: number;
+            timeoutSurvivor: number;
+            perTick: number;
+            illegal: number;
+        };
     };
 }
 
@@ -240,12 +248,24 @@ export class Sim {
                 moveSpeed: START_MOVE_SPEED, bombPower: 1, maxBombs: 1, placedBombs: 0,
                 lastDeathRow: -1, lastDeathCol: -1, numDies: 0, firstDieTimeMs: -1,
                 rewardThisStep: 0,
-                stats: { bombsPlaced: 0, woodDestroyed: 0, powerupsCollected: 0, knocksScored: 0, killsScored: 0, diedFromOwnBomb: 0, illegalMoves: 0, illegalBombs: 0, knocksReceived: 0 },
+                stats: {
+                    bombsPlaced: 0, woodDestroyed: 0, powerupsCollected: 0, knocksScored: 0, killsScored: 0,
+                    diedFromOwnBomb: 0, illegalMoves: 0, illegalBombs: 0, knocksReceived: 0,
+                    rewardBreakdown: {
+                        wood: 0, powerup: 0, knockScored: 0, knockReceived: 0, killScored: 0,
+                        death: 0, lastAlive: 0, timeoutSurvivor: 0, perTick: 0, illegal: 0,
+                    },
+                },
             });
         }
         this.elapsedMs = 0;
         this.ranking = [];
         this.done = false;
+    }
+
+    private addReward(p: SimPlayer, source: keyof SimPlayer['stats']['rewardBreakdown'], amount: number) {
+        p.rewardThisStep += amount;
+        p.stats.rewardBreakdown[source] += amount;
     }
 
     getCell(r: number, c: number): Cell {
@@ -296,7 +316,7 @@ export class Sim {
             // Penalize attempts to walk into walls/wood/bombs/oob: the first three are
             // outright illegal, and walking onto a bomb traps the agent on top of a fuse.
             if (target === 'S' || target === 'W' || target === 'B') {
-                p.rewardThisStep -= ILLEGAL_ACTION_PENALTY;
+                this.addReward(p, 'illegal', -ILLEGAL_ACTION_PENALTY);
                 p.stats.illegalMoves++;
                 continue;
             }
@@ -309,7 +329,7 @@ export class Sim {
 
     private placeBomb(p: SimPlayer, r: number, c: number) {
         if (p.placedBombs >= p.maxBombs || this.bombs[r][c] || this.blocks[r][c]) {
-            p.rewardThisStep -= ILLEGAL_ACTION_PENALTY;
+            this.addReward(p, 'illegal', -ILLEGAL_ACTION_PENALTY);
             p.stats.illegalBombs++;
             return;
         }
@@ -455,7 +475,7 @@ export class Sim {
                     if (this.blocks[r][c] === 'W') {
                         this.blocks[r][c] = undefined;
                         this.woodLeft--;
-                        this.players[cell.sourceOwnerIdx].rewardThisStep += REWARD_WOOD;
+                        this.addReward(this.players[cell.sourceOwnerIdx], 'wood', REWARD_WOOD);
                         this.players[cell.sourceOwnerIdx].stats.woodDestroyed++;
                         this.maybeSpawnPowerup(r, c);
                     }
@@ -510,10 +530,10 @@ export class Sim {
                 p.firstDieTimeMs = this.elapsedMs;
             }
             if (attacker !== p) {
-                attacker.rewardThisStep += REWARD_KNOCK_SCORED;
+                this.addReward(attacker, 'knockScored', REWARD_KNOCK_SCORED);
                 attacker.stats.knocksScored++;
             }
-            p.rewardThisStep += REWARD_KNOCK_RECEIVED;
+            this.addReward(p, 'knockReceived', REWARD_KNOCK_RECEIVED);
             p.stats.knocksReceived++;
         } else {
             this.kill(p, attacker);
@@ -526,12 +546,12 @@ export class Sim {
         p.dyDir = 0; p.dxDir = 0;
         if (!this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
         if (attacker !== p) {
-            attacker.rewardThisStep += REWARD_KILL_SCORED;
+            this.addReward(attacker, 'killScored', REWARD_KILL_SCORED);
             attacker.stats.killsScored++;
         } else {
             p.stats.diedFromOwnBomb = 1;
         }
-        p.rewardThisStep += REWARD_DEATH;
+        this.addReward(p, 'death', REWARD_DEATH);
 
         const numDrop = 4;
         const spots: [number, number][] = [];
@@ -583,7 +603,7 @@ export class Sim {
                 const tier = Math.round((p.moveSpeed - START_MOVE_SPEED) / MOVE_SPEED_INCREMENT) + 1;
                 if (tier < MAX_POWERUPS) p.moveSpeed += MOVE_SPEED_INCREMENT;
             }
-            p.rewardThisStep += REWARD_POWERUP;
+            this.addReward(p, 'powerup', REWARD_POWERUP);
             p.stats.powerupsCollected++;
         }
     }
@@ -606,7 +626,11 @@ export class Sim {
         if (alive.length === 0) return true;
         if (alive.length === 1 && this.cfg.numPlayers > 1) {
             if (!this.ranking.includes(alive[0].idx)) this.ranking.unshift(alive[0].idx);
-            alive[0].rewardThisStep += REWARD_LAST_ALIVE;
+            // Camping deterrent: only reward last-alive if the survivor actually
+            // participated (≥1 knock or kill). Pure survivors get nothing.
+            if (alive[0].stats.killsScored + alive[0].stats.knocksScored >= 1) {
+                this.addReward(alive[0], 'lastAlive', REWARD_LAST_ALIVE);
+            }
             return true;
         }
         if (this.elapsedMs >= this.cfg.maxTimeMs) {
@@ -614,7 +638,7 @@ export class Sim {
             // viable and the per-step penalty alone doesn't break the stalemate.
             for (const p of this.players) {
                 if (p.alive) {
-                    p.rewardThisStep += REWARD_TIMEOUT_SURVIVOR;
+                    this.addReward(p, 'timeoutSurvivor', REWARD_TIMEOUT_SURVIVOR);
                     if (!this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
                 }
             }
@@ -639,23 +663,7 @@ export class Sim {
         this.updateTimers(SIM_DT_MS);
 
         // Per-step survival penalty so STAY isn't the universally safest pick.
-        for (const p of this.players) if (p.alive) p.rewardThisStep += REWARD_PER_TICK_ALIVE;
-
-        // Engagement shaping: small per-tick reward when an alive enemy is within
-        // PROXIMITY_RADIUS manhattan cells. Breaks the mutual-avoidance basin by
-        // giving a tiny positive gradient toward "be near opponents."
-        for (const p of this.players) {
-            if (!p.alive) continue;
-            const py = Math.round(p.y), px = Math.round(p.x);
-            for (const other of this.players) {
-                if (other === p || !other.alive || other.knocked) continue;
-                const d = Math.abs(py - Math.round(other.y)) + Math.abs(px - Math.round(other.x));
-                if (d <= PROXIMITY_RADIUS) {
-                    p.rewardThisStep += REWARD_PROXIMITY_PER_TICK;
-                    break;
-                }
-            }
-        }
+        for (const p of this.players) if (p.alive) this.addReward(p, 'perTick', REWARD_PER_TICK_ALIVE);
 
         this.done = this.gameOver();
         return { rewards: this.players.map(p => p.rewardThisStep), done: this.done };

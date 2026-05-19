@@ -167,8 +167,10 @@ function perBeta(step: number, a: Args): number {
     return a.perBetaStart + (a.perBetaEnd - a.perBetaStart) * frac;
 }
 
-function pickAction(qValues: Float32Array, eps: number): Action {
-    if (Math.random() < eps) return Math.floor(Math.random() * NUM_ACTIONS) as Action;
+function pickAction(qValues: Float32Array, eps: number): { action: Action; greedy: boolean } {
+    if (Math.random() < eps) {
+        return { action: Math.floor(Math.random() * NUM_ACTIONS) as Action, greedy: false };
+    }
     // Reservoir tie-break: uniform among argmax candidates so flat Q's don't lock onto action 0.
     let best = 0;
     let bestV = qValues[0];
@@ -177,7 +179,7 @@ function pickAction(qValues: Float32Array, eps: number): Action {
         if (qValues[i] > bestV) { bestV = qValues[i]; best = i; nTies = 1; }
         else if (qValues[i] === bestV) { nTies++; if (Math.random() < 1 / nTies) best = i; }
     }
-    return best as Action;
+    return { action: best as Action, greedy: true };
 }
 
 function qBatch(model: tf.LayersModel, obs: Float32Array[]): Float32Array[] {
@@ -327,7 +329,9 @@ async function train() {
         const pendingReward = new Float32Array(numPlayers);
         const totalReward = new Float32Array(numPlayers);
         // Histogram of actions chosen by the learner this episode; index by Action enum.
+        // `greedy` excludes ε-random picks — surfaces the actual policy under exploitation.
         const learnerActionHist = new Int32Array(NUM_ACTIONS);
+        const learnerActionHistGreedy = new Int32Array(NUM_ACTIONS);
         let done = false;
         let stepInGame = 0;
         // Safety margin past the 60s @ 10ms = 6000 tick cap.
@@ -358,9 +362,12 @@ async function train() {
                     actions.push(env.sim.players[i].pendingAction);
                     continue;
                 }
-                const a = pickAction(qValues.get(i)!, i === 0 ? eps : args.epsOpponent);
+                const { action: a, greedy } = pickAction(qValues.get(i)!, i === 0 ? eps : args.epsOpponent);
                 actions.push(a);
-                if (i === 0) learnerActionHist[a]++;
+                if (i === 0) {
+                    learnerActionHist[a]++;
+                    if (greedy) learnerActionHistGreedy[a]++;
+                }
 
                 // Off-policy: opponent transitions are valid training data too.
                 const q_i = stepQueue[i];
@@ -513,16 +520,28 @@ async function train() {
         const learnLine = learnCount > 0
             ? ` learn[n=${learnCount}]: loss=${(learnLossAcc / lc).toExponential(2)} |td|=${(learnTdAcc / lc).toFixed(3)} q=${(learnQAcc / lc).toFixed(3)} gradNorm=${(learnGradAcc / lc).toFixed(3)}`
             : ' learn[n=0]';
-        // Action histogram: STAY,UP,DOWN,LEFT,RIGHT,BOMB → s/u/d/l/r/b.
-        const totalActs = Math.max(1, Array.from(learnerActionHist).reduce((a, b) => a + b, 0));
-        const actPct = (n: number) => Math.round((n / totalActs) * 100).toString().padStart(2);
-        const actHist = `s/u/d/l/r/b=${actPct(learnerActionHist[0])}/${actPct(learnerActionHist[1])}/${actPct(learnerActionHist[2])}/${actPct(learnerActionHist[3])}/${actPct(learnerActionHist[4])}/${actPct(learnerActionHist[5])}`;
+        // Action histograms: STAY,UP,DOWN,LEFT,RIGHT,BOMB → order fixed; greedy excludes ε noise.
+        const pctHist = (hist: Int32Array) => {
+            const total = Math.max(1, hist[0] + hist[1] + hist[2] + hist[3] + hist[4] + hist[5]);
+            const p = (n: number) => Math.round((n / total) * 100).toString().padStart(2);
+            return `${p(hist[0])}/${p(hist[1])}/${p(hist[2])}/${p(hist[3])}/${p(hist[4])}/${p(hist[5])}`;
+        };
+        const rb = ls.rewardBreakdown;
+        // Compact reward decomposition: each component to 1 decimal, only the
+        // signed deltas matter for diagnosing which incentives dominate.
+        const rBreak =
+            `W${rb.wood.toFixed(1)} Pup${rb.powerup.toFixed(1)} ` +
+            `Kn+${rb.knockScored.toFixed(1)} Kn${rb.knockReceived.toFixed(1)} ` +
+            `Kill${rb.killScored.toFixed(1)} D${rb.death.toFixed(1)} ` +
+            `LA${rb.lastAlive.toFixed(1)} TO${rb.timeoutSurvivor.toFixed(1)} ` +
+            `Tik${rb.perTick.toFixed(1)} Ill${rb.illegal.toFixed(1)}`;
         console.log(
             `[train] ep=${ep} step=${globalStep} eps=${epsilon(globalStep, args).toFixed(3)} ` +
             `np=${numPlayers} rLearner=${totalReward[0].toFixed(2)} rOpp=${oppRewardMean.toFixed(2)} ` +
-            `wood=${ls.woodDestroyed} kills=${ls.killsScored} kRcv=${ls.knocksReceived} ` +
+            `wood=${ls.woodDestroyed} kills=${ls.killsScored} kSc=${ls.knocksScored} kRcv=${ls.knocksReceived} ` +
             `illM=${ls.illegalMoves} illB=${ls.illegalBombs} alive=${learnerPlayer.alive ? 1 : 0} ` +
-            `act[${actHist}] ` +
+            `act[${pctHist(learnerActionHist)}] gAct[${pctHist(learnerActionHistGreedy)}] ` +
+            `rBreak[${rBreak}] ` +
             `bufSize=${buffer.size} opps=${opponentSources.slice(1).join(',')} pool=${pool.size()}/${args.poolSize} (pPool=${poolOppCount})` +
             learnLine
         );
