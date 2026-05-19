@@ -13,7 +13,8 @@ export const BOARD_W = 19;
 //   3  bomb fuse (1=just placed, 0=about to explode)
 //   4  time-to-blast (1=exploding now, 0=>=DANGER_LOOKAHEAD_MS away)
 //   5  powerup NUM         6  powerup SPE         7  powerup STR
-//   8  self position       9  enemy positions    10  knocked enemies (vulnerable)
+//   8  self position       9  enemy positions
+//  10  knocked enemies: knockMsLeft/KNOCK_DURATION_MS (1=just knocked, 0=recovering now)
 export const NUM_CHANNELS = 11;
 // Scalars (all normalized): bombPower/13, maxBombs/13, moveSpeed tier/13,
 // placedBombs/maxBombs, woodLeft/100, game phase (0=lots of walls, 1=none).
@@ -23,7 +24,9 @@ export const OBS_SPATIAL_SIZE = BOARD_H * BOARD_W * NUM_CHANNELS;
 export const OBS_SIZE = OBS_SPATIAL_SIZE + NUM_SCALARS;
 
 const BOMB_FUSE_MS = 3000;
-const DANGER_LOOKAHEAD_MS = 1500;
+// Covers the full fuse so the danger map lights up at placement time.
+const DANGER_LOOKAHEAD_MS = 3000;
+const KNOCK_DURATION_MS = 6000;
 const MAX_POWERUP_TIER = 13;
 const START_MOVE_SPEED = 0.045;
 const MOVE_SPEED_INCREMENT = 0.003;
@@ -39,7 +42,7 @@ export interface ObsView {
     getCell(r: number, c: number): string;
     bombs: Array<{ row: number; col: number; power: number; fuseRemainingMs: number }>;
     self: { y: number; x: number; bombPower: number; maxBombs: number; moveSpeed: number; placedBombs: number };
-    enemies: Array<{ y: number; x: number; alive: boolean; knocked: boolean }>;
+    enemies: Array<{ y: number; x: number; alive: boolean; knocked: boolean; knockMsLeft: number }>;
     woodLeft: number;
 }
 
@@ -112,8 +115,11 @@ export function encode(view: ObsView): Float32Array {
         const er = Math.round(e.y);
         const ex = Math.round(e.x);
         if (er < 0 || er >= view.boardH || ex < 0 || ex >= view.boardW) continue;
-        if (e.knocked) out[idx(er, ex, 10)] = 1;
-        else out[idx(er, ex, 9)] = 1;
+        if (e.knocked) {
+            out[idx(er, ex, 10)] = Math.max(0, Math.min(1, e.knockMsLeft / KNOCK_DURATION_MS));
+        } else {
+            out[idx(er, ex, 9)] = 1;
+        }
     }
 
     const off = OBS_SPATIAL_SIZE;

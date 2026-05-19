@@ -33,6 +33,11 @@ export const MAX_POWERUPS = 13;
 export const EXPLOSION_TRAVEL_MS = 25; // game.ts:12
 export const DEATH_CHECK_WINDOW_MS = 50; // 2nd checkPlayerDeaths is +50ms in recurseExecute
 
+// Per-attempt penalty for actions the sim rejects: moving into stone/wood/bomb/oob,
+// or placing a bomb when slot is full / cell is occupied. Small relative to the
+// knock/kill rewards (~0.5–3.0) so it nudges without dominating learning.
+const ILLEGAL_ACTION_PENALTY = 0.02;
+
 const START_MOVE_SPEED = 0.045;
 const MOVE_SPEED_INCREMENT = 0.003;
 // Production: cells/frame = speed*1.667 at 60Hz ⇒ cells/ms = speed*1.667*60/1000.
@@ -266,7 +271,13 @@ export class Sim {
             const dx = DIR_DX[a];
             const tr = Math.round(p.y) + dy;
             const tc = Math.round(p.x) + dx;
-            if (!this.isPassable(tr, tc)) continue;
+            const target = this.getCell(tr, tc);
+            // Penalize attempts to walk into walls/wood/bombs/oob: the first three are
+            // outright illegal, and walking onto a bomb traps the agent on top of a fuse.
+            if (target === 'S' || target === 'W' || target === 'B') {
+                p.rewardThisStep -= ILLEGAL_ACTION_PENALTY;
+                continue;
+            }
             p.moveTargetY = tr;
             p.moveTargetX = tc;
             p.dyDir = dy;
@@ -275,9 +286,10 @@ export class Sim {
     }
 
     private placeBomb(p: SimPlayer, r: number, c: number) {
-        if (p.placedBombs >= p.maxBombs) return;
-        if (this.bombs[r][c]) return;
-        if (this.blocks[r][c]) return;
+        if (p.placedBombs >= p.maxBombs || this.bombs[r][c] || this.blocks[r][c]) {
+            p.rewardThisStep -= ILLEGAL_ACTION_PENALTY;
+            return;
+        }
         this.bombs[r][c] = { row: r, col: c, power: p.bombPower, fuseRemainingMs: BOMB_FUSE_MS, ownerIdx: p.idx };
         p.placedBombs++;
         p.stats.bombsPlaced++;
@@ -420,7 +432,7 @@ export class Sim {
                     if (this.blocks[r][c] === 'W') {
                         this.blocks[r][c] = undefined;
                         this.woodLeft--;
-                        this.players[cell.sourceOwnerIdx].rewardThisStep += 0.1;
+                        this.players[cell.sourceOwnerIdx].rewardThisStep += 0.3;
                         this.players[cell.sourceOwnerIdx].stats.woodDestroyed++;
                         this.maybeSpawnPowerup(r, c);
                     }

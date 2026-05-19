@@ -39,7 +39,7 @@ export class Env {
             },
             enemies: this.sim.players
                 .filter(p => p.idx !== playerIdx)
-                .map(p => ({ y: p.y, x: p.x, alive: p.alive, knocked: p.knocked })),
+                .map(p => ({ y: p.y, x: p.x, alive: p.alive, knocked: p.knocked, knockMsLeft: p.knockMsLeft })),
             woodLeft: this.sim.woodLeft,
         };
     }

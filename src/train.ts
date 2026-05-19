@@ -75,9 +75,11 @@ function parseArgs(): Args {
         batchSize: 128,
         gamma: 0.99,
         learnEvery: 8,
-        // n=5 doesn't span a full bomb fuse (~300 ticks) but it propagates
-        // knock-then-kill credit (~600 tick horizon) far faster than 1-step TD.
-        nStep: 5,
+        // Decisions are cell-aligned (~17 ticks apart); bomb fuse is 300 ticks
+        // (~18 decisions) plus ray travel. n=20 ≈ 340 ticks keeps the place-bomb
+        // decision in-queue until its explosion fires, so wood/kill reward flows
+        // back to it via the n-step return.
+        nStep: 20,
         targetTau: 0.005,
         epsStart: 1.0,
         epsEnd: 0.05,
