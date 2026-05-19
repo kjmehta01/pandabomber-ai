@@ -44,12 +44,16 @@ async function makeModelAgent(modelPath: string, label: string): Promise<Agent> 
     await importWeights(model, modelPath);
     return {
         name: label,
-        selectAction: (obs) => tf.tidy(() => {
+        selectAction: (obs, sim, seatIdx) => tf.tidy(() => {
             const [spatial, scalar] = obsToTensors(obs);
             const q = model.predict([spatial, scalar]) as tf.Tensor;
             const data = q.dataSync();
-            let best = 0, bestV = data[0];
-            for (let i = 1; i < NUM_ACTIONS; i++) if (data[i] > bestV) { bestV = data[i]; best = i; }
+            const mask = sim.legalActionMask(seatIdx);
+            let best = -1, bestV = -Infinity;
+            for (let i = 0; i < NUM_ACTIONS; i++) {
+                if (!mask[i]) continue;
+                if (best < 0 || data[i] > bestV) { bestV = data[i]; best = i; }
+            }
             return best as Action;
         }),
         dispose: () => model.dispose(),

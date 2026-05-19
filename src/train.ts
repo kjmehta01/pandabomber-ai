@@ -29,7 +29,7 @@ import {
     obsBatchToTensors,
     flatBatchToTensors,
 } from './model';
-import { OBS_SIZE } from './observation';
+import { OBS_SIZE, legalMaskFromObs } from './observation';
 import { Action } from './sim';
 import { PrioritizedReplayBuffer } from './per';
 
@@ -167,16 +167,21 @@ function perBeta(step: number, a: Args): number {
     return a.perBetaStart + (a.perBetaEnd - a.perBetaStart) * frac;
 }
 
-function pickAction(qValues: Float32Array, eps: number): { action: Action; greedy: boolean } {
+// Mask: 1=legal, 0=illegal. STAY is guaranteed legal so there's always ≥1 valid pick.
+function pickAction(qValues: Float32Array, eps: number, mask: Uint8Array): { action: Action; greedy: boolean } {
     if (Math.random() < eps) {
-        return { action: Math.floor(Math.random() * NUM_ACTIONS) as Action, greedy: false };
+        // Uniform over legal actions only.
+        const legal: number[] = [];
+        for (let i = 0; i < NUM_ACTIONS; i++) if (mask[i]) legal.push(i);
+        return { action: legal[Math.floor(Math.random() * legal.length)] as Action, greedy: false };
     }
     // Reservoir tie-break: uniform among argmax candidates so flat Q's don't lock onto action 0.
-    let best = 0;
-    let bestV = qValues[0];
-    let nTies = 1;
-    for (let i = 1; i < NUM_ACTIONS; i++) {
-        if (qValues[i] > bestV) { bestV = qValues[i]; best = i; nTies = 1; }
+    let best = -1;
+    let bestV = -Infinity;
+    let nTies = 0;
+    for (let i = 0; i < NUM_ACTIONS; i++) {
+        if (!mask[i]) continue;
+        if (best < 0 || qValues[i] > bestV) { bestV = qValues[i]; best = i; nTies = 1; }
         else if (qValues[i] === bestV) { nTies++; if (Math.random() < 1 / nTies) best = i; }
     }
     return { action: best as Action, greedy: true };
@@ -362,7 +367,8 @@ async function train() {
                     actions.push(env.sim.players[i].pendingAction);
                     continue;
                 }
-                const { action: a, greedy } = pickAction(qValues.get(i)!, i === 0 ? eps : args.epsOpponent);
+                const mask = env.sim.legalActionMask(i);
+                const { action: a, greedy } = pickAction(qValues.get(i)!, i === 0 ? eps : args.epsOpponent, mask);
                 actions.push(a);
                 if (i === 0) {
                     learnerActionHist[a]++;
@@ -401,6 +407,17 @@ async function train() {
                 // tf.keep |delta| out of variableGrads' scope so we can read TD
                 // errors for PER priorities without a second forward pass on `online`.
                 const absTd = new Float32Array(args.batchSize);
+                // Build a [N, 6] mask buffer where illegal actions in sNext are −1e9 so
+                // the target argmax can't pick them. We don't store masks in the buffer;
+                // they're recoverable from the obs (channels 0/1/2/8 + scalar 3).
+                const maskBias = new Float32Array(args.batchSize * NUM_ACTIONS);
+                for (let i = 0; i < args.batchSize; i++) {
+                    const m = legalMaskFromObs(batch.sNext, i * OBS_SIZE);
+                    for (let a = 0; a < NUM_ACTIONS; a++) {
+                        maskBias[i * NUM_ACTIONS + a] = m[a] ? 0 : -1e9;
+                    }
+                }
+
                 tf.tidy(() => {
                     const [sSpatial, sScalar] = flatBatchToTensors(batch.s, args.batchSize);
                     const [sNextSpatial, sNextScalar] = flatBatchToTensors(batch.sNext, args.batchSize);
@@ -409,9 +426,10 @@ async function train() {
                     const dT = tf.tensor1d(Float32Array.from(batch.done));
                     const gammaNT = tf.tensor1d(gammaNBuf);
                     const isW = tf.tensor1d(batch.isWeights);
+                    const maskBiasT = tf.tensor2d(maskBias, [args.batchSize, NUM_ACTIONS]);
 
                     // Double-DQN target with n-step return.
-                    const qNextOnline = online.predict([sNextSpatial, sNextScalar]) as tf.Tensor;
+                    const qNextOnline = (online.predict([sNextSpatial, sNextScalar]) as tf.Tensor).add(maskBiasT);
                     const aStar = qNextOnline.argMax(1);
                     const qNextTarget = target.predict([sNextSpatial, sNextScalar]) as tf.Tensor;
                     const oneHot = tf.oneHot(aStar.cast('int32'), NUM_ACTIONS);
@@ -534,7 +552,7 @@ async function train() {
             `Kn+${rb.knockScored.toFixed(1)} Kn${rb.knockReceived.toFixed(1)} ` +
             `Kill${rb.killScored.toFixed(1)} D${rb.death.toFixed(1)} ` +
             `LA${rb.lastAlive.toFixed(1)} TO${rb.timeoutSurvivor.toFixed(1)} ` +
-            `Tik${rb.perTick.toFixed(1)} Ill${rb.illegal.toFixed(1)}`;
+            `Tik${rb.perTick.toFixed(1)}`;
         console.log(
             `[train] ep=${ep} step=${globalStep} eps=${epsilon(globalStep, args).toFixed(3)} ` +
             `np=${numPlayers} rLearner=${totalReward[0].toFixed(2)} rOpp=${oppRewardMean.toFixed(2)} ` +

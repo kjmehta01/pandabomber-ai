@@ -33,13 +33,10 @@ export const MAX_POWERUPS = 13;
 export const EXPLOSION_TRAVEL_MS = 25; // game.ts:12
 export const DEATH_CHECK_WINDOW_MS = 50; // 2nd checkPlayerDeaths is +50ms in recurseExecute
 
-// Per-attempt penalty for actions the sim rejects: moving into stone/wood/bomb/oob,
-// or placing a bomb when slot is full / cell is occupied. Small relative to the
-// knock/kill rewards so it nudges without dominating learning.
-const ILLEGAL_ACTION_PENALTY = 0.1;
-
 // Reward weights. Kill > knock > wood ordering chosen so engagement dominates
-// wood-farming when both are available.
+// wood-farming when both are available. There is no illegal-action penalty:
+// rollout-time masking (see legalActionMask) prevents the agent from picking
+// rejected actions in the first place, so the penalty would never fire.
 const REWARD_WOOD = 0.1;
 const REWARD_POWERUP = 0.05;
 const REWARD_KNOCK_SCORED = 1.0;
@@ -120,7 +117,6 @@ export interface SimPlayer {
             lastAlive: number;
             timeoutSurvivor: number;
             perTick: number;
-            illegal: number;
         };
     };
 }
@@ -253,7 +249,7 @@ export class Sim {
                     diedFromOwnBomb: 0, illegalMoves: 0, illegalBombs: 0, knocksReceived: 0,
                     rewardBreakdown: {
                         wood: 0, powerup: 0, knockScored: 0, knockReceived: 0, killScored: 0,
-                        death: 0, lastAlive: 0, timeoutSurvivor: 0, perTick: 0, illegal: 0,
+                        death: 0, lastAlive: 0, timeoutSurvivor: 0, perTick: 0,
                     },
                 },
             });
@@ -289,6 +285,30 @@ export class Sim {
         return p.dyDir === 0 && p.dxDir === 0;
     }
 
+    // Mask of which actions the sim would accept right now for this player.
+    // 1 = legal, 0 = would be rejected (with the illegal-action penalty). Used at
+    // rollout time so the policy never picks structurally-impossible actions —
+    // breaks the STAY-collapse equilibrium where illegal penalties dominate the
+    // Q-landscape and the agent's safest pick is to do nothing.
+    legalActionMask(playerIdx: number): Uint8Array {
+        const mask = new Uint8Array(NUM_ACTIONS);
+        mask[ACTION_STAY] = 1;
+        const p = this.players[playerIdx];
+        if (!p.alive || p.knocked) return mask;
+        const r = Math.round(p.y);
+        const c = Math.round(p.x);
+        for (let a = 1; a <= 4; a++) {
+            const tr = r + DIR_DY[a];
+            const tc = c + DIR_DX[a];
+            const cell = this.getCell(tr, tc);
+            if (cell !== 'S' && cell !== 'W' && cell !== 'B') mask[a] = 1;
+        }
+        if (p.placedBombs < p.maxBombs && !this.bombs[r][c] && !this.blocks[r][c]) {
+            mask[ACTION_BOMB] = 1;
+        }
+        return mask;
+    }
+
     setAction(playerIdx: number, action: Action) {
         const p = this.players[playerIdx];
         if (!p.alive) return;
@@ -313,10 +333,10 @@ export class Sim {
             const tr = Math.round(p.y) + dy;
             const tc = Math.round(p.x) + dx;
             const target = this.getCell(tr, tc);
-            // Penalize attempts to walk into walls/wood/bombs/oob: the first three are
-            // outright illegal, and walking onto a bomb traps the agent on top of a fuse.
+            // Reject walks into walls/wood/bombs/oob. With action masking these
+            // should be unreachable from rollout; the counter stays as a diagnostic
+            // tripwire if masking ever drifts.
             if (target === 'S' || target === 'W' || target === 'B') {
-                this.addReward(p, 'illegal', -ILLEGAL_ACTION_PENALTY);
                 p.stats.illegalMoves++;
                 continue;
             }
@@ -329,7 +349,6 @@ export class Sim {
 
     private placeBomb(p: SimPlayer, r: number, c: number) {
         if (p.placedBombs >= p.maxBombs || this.bombs[r][c] || this.blocks[r][c]) {
-            this.addReward(p, 'illegal', -ILLEGAL_ACTION_PENALTY);
             p.stats.illegalBombs++;
             return;
         }

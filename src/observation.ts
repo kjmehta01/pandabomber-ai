@@ -130,6 +130,41 @@ function computeBlastTimes(view: ObsView): Float32Array {
     return out;
 }
 
+// Recover the legal-action mask from a stored observation. Channel layout is the
+// contract: 0=stone, 1=wood, 2=bomb, 8=self pos, scalar[3]=placedBombs/maxBombs.
+// Used at training time to mask the target argmax over Q(s_next) without storing
+// masks in the PER buffer. Action order matches sim.Action: 0=STAY 1=UP 2=DOWN
+// 3=LEFT 4=RIGHT 5=BOMB.
+const NUM_ACTIONS_LOCAL = 6;
+const MASK_DIRS: Array<[number, number, number]> = [
+    [1, -1, 0], [2, 1, 0], [3, 0, -1], [4, 0, 1],
+];
+export function legalMaskFromObs(obs: Float32Array, offset: number = 0): Uint8Array {
+    const mask = new Uint8Array(NUM_ACTIONS_LOCAL);
+    mask[0] = 1; // STAY always legal
+    let sr = -1, sc = -1;
+    outer: for (let r = 0; r < BOARD_H; r++) {
+        for (let c = 0; c < BOARD_W; c++) {
+            if (obs[offset + idx(r, c, 8)] > 0.5) { sr = r; sc = c; break outer; }
+        }
+    }
+    if (sr < 0) return mask; // self off-board (dead) → only STAY
+    for (const [a, dr, dc] of MASK_DIRS) {
+        const tr = sr + dr;
+        const tc = sc + dc;
+        if (tr < 0 || tr >= BOARD_H || tc < 0 || tc >= BOARD_W) continue;
+        if (obs[offset + idx(tr, tc, 0)] > 0.5) continue; // stone
+        if (obs[offset + idx(tr, tc, 1)] > 0.5) continue; // wood
+        if (obs[offset + idx(tr, tc, 2)] > 0.5) continue; // bomb
+        mask[a] = 1;
+    }
+    // BOMB legal if placedBombs/maxBombs<1 (scalar idx 3) and no bomb on self cell.
+    if (obs[offset + OBS_SPATIAL_SIZE + 3] < 0.999 && obs[offset + idx(sr, sc, 2)] < 0.5) {
+        mask[5] = 1;
+    }
+    return mask;
+}
+
 export function encode(view: ObsView): Float32Array {
     const out = new Float32Array(OBS_SIZE);
     const blastTimes = computeBlastTimes(view);
