@@ -6,11 +6,9 @@
 // All seats' transitions feed one shared PER buffer (DQN is off-policy).
 //
 // Opponents play with a small fixed ε so they're not perfectly predictable.
-// Pool snapshots are step-keyed (not episode-keyed) so cadence is invariant to
-// curriculum-driven episode-length changes. Curriculum: easier 2-player games for
-// the first N episodes, then 4. Warmup: pure-random until the buffer has diverse
-// exploration. Decisions only commit at cell-aligned ticks; intermediate ticks
-// re-play pendingAction.
+// Pool snapshots are step-keyed (not episode-keyed). Warmup: pure-random until the
+// buffer has diverse exploration. Decisions only commit at cell-aligned ticks;
+// intermediate ticks re-play pendingAction.
 //
 // Usage:
 //   npx ts-node src/train.ts --episodes=2000 --save=checkpoints/latest.json
@@ -56,9 +54,7 @@ interface Args {
     poolSize: number;
     snapshotEverySteps: number;
     pPool: number;          // per-seat P(opponent samples from pool) vs current online
-    curriculumPlayers: number;
-    curriculumEpisodes: number;
-    fullPlayers: number;
+    numPlayers: number;
     perAlpha: number;
     perBetaStart: number;
     perBetaEnd: number;
@@ -93,9 +89,7 @@ function parseArgs(): Args {
         poolSize: 10,
         snapshotEverySteps: 250_000,
         pPool: 0.5,
-        curriculumPlayers: 2,
-        curriculumEpisodes: 500,
-        fullPlayers: 4,
+        numPlayers: 4,
         perAlpha: 0.6,
         perBetaStart: 0.4,
         perBetaEnd: 1.0,
@@ -246,9 +240,9 @@ async function train() {
     const online = buildModel();
     const target = buildModel();
     // One model per non-learner seat; weights swapped per episode + seat.
-    const maxOpponents = Math.max(1, args.fullPlayers - 1);
+    const numOpponents = Math.max(1, args.numPlayers - 1);
     const opponents: tf.LayersModel[] = [];
-    for (let i = 0; i < maxOpponents; i++) {
+    for (let i = 0; i < numOpponents; i++) {
         const m = buildModel();
         m.setWeights(online.getWeights());
         opponents.push(m);
@@ -302,10 +296,7 @@ async function train() {
     let learnLossAcc = 0, learnTdAcc = 0, learnQAcc = 0, learnGradAcc = 0, learnCount = 0;
 
     for (let ep = startEpisode; ep < startEpisode + args.episodes; ep++) {
-        // Curriculum: easier 2-player games for the first N episodes, then 4-player.
-        const numPlayers = ep < startEpisode + args.curriculumEpisodes
-            ? args.curriculumPlayers
-            : args.fullPlayers;
+        const numPlayers = args.numPlayers;
         const env = new Env({
             numPlayers,
             seed: args.seed + ep,
