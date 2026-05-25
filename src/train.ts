@@ -29,7 +29,7 @@ import {
     obsBatchToTensors,
     flatBatchToTensors,
 } from './model';
-import { OBS_SIZE, legalMaskFromObs } from './observation';
+import { OBS_SIZE, BOARD_H, BOARD_W, NUM_CHANNELS, NUM_SCALARS, legalMaskFromObs } from './observation';
 import { Action } from './sim';
 import { PrioritizedReplayBuffer } from './per';
 
@@ -40,7 +40,8 @@ interface Args {
     batchSize: number;
     gamma: number;
     learnEvery: number;
-    nStep: number;          // n-step return horizon
+    nStepHorizonMs: number; // flush queue head when wall-clock elapsed ≥ this (covers bomb fuse)
+    nStepMax: number;       // safety cap on per-seat queue length (stationary agents make 1 decision/tick)
     targetTau: number;
     epsStart: number;
     epsEnd: number;
@@ -71,13 +72,15 @@ function parseArgs(): Args {
         batchSize: 128,
         gamma: 0.99,
         learnEvery: 8,
-        // Decisions are cell-aligned (~12–22 ticks apart, faster as moveSpeed
-        // grows); bomb fuse is 300 ticks plus ray travel. n=30 covers the fuse
-        // even at max speed (~12 ticks/decision → 360 ticks for n=30), so the
-        // place-bomb decision stays in-queue until its explosion fires and the
-        // wood/kill/knock reward propagates via the n-step return.
-        nStep: 30,
-        targetTau: 0.005,
+        // Decisions happen at cell alignment for movers (every 12–22 ticks) but
+        // every single 10ms tick when STAY/BOMB (dyDir/dxDir stay 0). Fixed-n
+        // n-step would only cover 300ms for stationary agents vs the 3000ms bomb
+        // fuse, dropping the wood/kill reward out of the n-step return entirely.
+        // Use wall-clock-elapsed instead so the bomb-decision's explosion reward
+        // is always inside its own n-step window.
+        nStepHorizonMs: 3500,
+        nStepMax: 500,
+        targetTau: 0.001,
         epsStart: 1.0,
         epsEnd: 0.05,
         epsDecaySteps: 500_000,
@@ -135,12 +138,14 @@ class OpponentPool {
     }
 }
 
-// One queued decision: the obs the seat saw, the action picked, and the reward
-// accumulated across ticks between this decision and the next.
+// One queued decision: the obs the seat saw, the action picked, the reward
+// accumulated across ticks between this decision and the next, and the sim
+// wall-clock at decision time (for ms-based n-step flushing).
 interface StepEntry {
     obs: Float32Array;
     act: Action;
     reward: number;
+    decisionMs: number;
 }
 
 // Pop queue head and push it to the buffer as an n-step transition.
@@ -185,6 +190,28 @@ function pickAction(qValues: Float32Array, eps: number, mask: Uint8Array): { act
         else if (qValues[i] === bestV) { nTies++; if (Math.random() < 1 / nTies) best = i; }
     }
     return { action: best as Action, greedy: true };
+}
+
+// Force Adam to allocate its slot variables (m, v) before any real learn step.
+// Without this, a resumed run takes one Adam update with empty slots BEFORE we
+// can apply the restored optimizer state — and that corrupts the weights.
+// We snapshot weights, run a tiny dummy update (which allocates slots), then
+// restore the snapshot so this call is a no-op on the weights themselves.
+function primeOptimizer(model: tf.LayersModel, optimizer: tf.Optimizer): void {
+    const snapshot = model.getWeights().map(w => w.clone());
+    tf.tidy(() => {
+        const dummySpatial = tf.zeros([1, BOARD_H, BOARD_W, NUM_CHANNELS]);
+        const dummyScalar = tf.zeros([1, NUM_SCALARS]);
+        const grads = tf.variableGrads(() => {
+            const out = model.predict([dummySpatial, dummyScalar]) as tf.Tensor;
+            // Non-zero loss so gradients aren't identically zero (Adam needs |g|>0
+            // in the first step to populate v, otherwise sqrt(v) divides by 0).
+            return out.square().mean() as tf.Scalar;
+        });
+        optimizer.applyGradients(grads.grads as unknown as Parameters<typeof optimizer.applyGradients>[0]);
+    });
+    model.setWeights(snapshot);
+    snapshot.forEach(t => t.dispose());
 }
 
 function qBatch(model: tf.LayersModel, obs: Float32Array[]): Float32Array[] {
@@ -300,6 +327,12 @@ async function train() {
     if (!resumed) console.log('[train] starting from fresh weights');
 
     const optimizer = tf.train.adam(args.learningRate);
+    primeOptimizer(online, optimizer);
+    if (pendingOptState) {
+        const ok = await applyOptimizerState(optimizer, pendingOptState);
+        if (ok) console.log(`[train] restored optimizer state (${pendingOptState.length} slot vars)`);
+        pendingOptState = undefined;
+    }
     const buffer = new PrioritizedReplayBuffer(args.bufferSize, args.perAlpha);
     const pool = new OpponentPool(args.poolSize);
     const stats = new EpisodeStats();
@@ -378,10 +411,17 @@ async function train() {
                 // Off-policy: opponent transitions are valid training data too.
                 const q_i = stepQueue[i];
                 if (q_i.length > 0) q_i[q_i.length - 1].reward = pendingReward[i];
-                if (q_i.length >= args.nStep) {
-                    pushNStep(buffer, q_i, obs[i], false, args.nStep, args.gamma);
+                // Flush every queue head whose wall-clock age covers the bomb fuse,
+                // OR pop the oldest if we hit the safety cap. Loop handles long
+                // dead/knocked gaps that backlog multiple stale heads.
+                const nowMs = env.sim.elapsedMs;
+                while (q_i.length > 0 && (
+                    nowMs - q_i[0].decisionMs >= args.nStepHorizonMs ||
+                    q_i.length >= args.nStepMax
+                )) {
+                    pushNStep(buffer, q_i, obs[i], false, q_i.length, args.gamma);
                 }
-                q_i.push({ obs: obs[i], act: a, reward: 0 });
+                q_i.push({ obs: obs[i], act: a, reward: 0, decisionMs: nowMs });
                 pendingReward[i] = 0;
             }
 
@@ -478,13 +518,6 @@ async function train() {
                 });
                 buffer.updatePriorities(batch.indices, absTd);
                 softUpdate(online, target, args.targetTau);
-
-                // First learn step allocates Adam's slot variables — apply any
-                // pending optimizer state from resume now.
-                if (pendingOptState) {
-                    await applyOptimizerState(optimizer, pendingOptState);
-                    pendingOptState = undefined;
-                }
             }
 
             if (globalStep >= args.warmupSteps && globalStep - lastSnapshotStep >= args.snapshotEverySteps) {

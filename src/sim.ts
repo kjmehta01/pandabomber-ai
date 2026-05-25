@@ -37,12 +37,14 @@ export const DEATH_CHECK_WINDOW_MS = 50; // 2nd checkPlayerDeaths is +50ms in re
 // wood-farming when both are available. There is no illegal-action penalty:
 // rollout-time masking (see legalActionMask) prevents the agent from picking
 // rejected actions in the first place, so the penalty would never fire.
-const REWARD_WOOD = 0.1;
-const REWARD_POWERUP = 0.05;
-const REWARD_KNOCK_SCORED = 1.0;
-const REWARD_KNOCK_RECEIVED = -1.0;
-const REWARD_KILL_SCORED = 6.0;
+const REWARD_WOOD = 0.5;
+const REWARD_POWERUP = 0.5;
+const REWARD_KNOCK_SCORED = 3.0;
+const REWARD_KNOCK_RECEIVED = -0.2;
+const REWARD_KNOCK_SELF = -0.4;
+const REWARD_KILL_SCORED = 15.0;
 const REWARD_DEATH = -1.5;
+const REWARD_DEATH_SELF = -3.0;
 const REWARD_LAST_ALIVE = 6.0;
 const REWARD_TIMEOUT_SURVIVOR = -1.5;
 const REWARD_PER_TICK_ALIVE = -0.001;
@@ -112,8 +114,10 @@ export interface SimPlayer {
             powerup: number;
             knockScored: number;
             knockReceived: number;
+            knockSelf: number;
             killScored: number;
             death: number;
+            deathSelf: number;
             lastAlive: number;
             timeoutSurvivor: number;
             perTick: number;
@@ -248,8 +252,8 @@ export class Sim {
                     bombsPlaced: 0, woodDestroyed: 0, powerupsCollected: 0, knocksScored: 0, killsScored: 0,
                     diedFromOwnBomb: 0, illegalMoves: 0, illegalBombs: 0, knocksReceived: 0,
                     rewardBreakdown: {
-                        wood: 0, powerup: 0, knockScored: 0, knockReceived: 0, killScored: 0,
-                        death: 0, lastAlive: 0, timeoutSurvivor: 0, perTick: 0,
+                        wood: 0, powerup: 0, knockScored: 0, knockReceived: 0, knockSelf: 0, killScored: 0,
+                        death: 0, deathSelf: 0, lastAlive: 0, timeoutSurvivor: 0, perTick: 0,
                     },
                 },
             });
@@ -551,8 +555,10 @@ export class Sim {
             if (attacker !== p) {
                 this.addReward(attacker, 'knockScored', REWARD_KNOCK_SCORED);
                 attacker.stats.knocksScored++;
+                this.addReward(p, 'knockReceived', REWARD_KNOCK_RECEIVED);
+            } else {
+                this.addReward(p, 'knockSelf', REWARD_KNOCK_SELF);
             }
-            this.addReward(p, 'knockReceived', REWARD_KNOCK_RECEIVED);
             p.stats.knocksReceived++;
         } else {
             this.kill(p, attacker);
@@ -567,10 +573,11 @@ export class Sim {
         if (attacker !== p) {
             this.addReward(attacker, 'killScored', REWARD_KILL_SCORED);
             attacker.stats.killsScored++;
+            this.addReward(p, 'death', REWARD_DEATH);
         } else {
             p.stats.diedFromOwnBomb = 1;
+            this.addReward(p, 'deathSelf', REWARD_DEATH_SELF);
         }
-        this.addReward(p, 'death', REWARD_DEATH);
 
         const numDrop = 4;
         const spots: [number, number][] = [];

@@ -22,7 +22,8 @@ export const DENSE_UNITS = 64;
 export const KERNEL_SIZE = 3;
 
 const LAYER_NAMES = ['conv1', 'conv2', 'dense1', 'value', 'advantage'] as const;
-export const ARCH_TAG = 'cnn-dueling-v1';
+// v2: egocentric centered view + 3 new channels (bombPower, ttr, survivability) + safe-neighbors scalar.
+export const ARCH_TAG = 'cnn-dueling-v2';
 
 // Dueling combine layer: Q = V + (A − mean A). Stateless.
 class DuelingCombine extends tf.layers.Layer {

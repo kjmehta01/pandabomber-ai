@@ -41,8 +41,14 @@ export class PrioritizedReplayBuffer {
     private maxPrio = 1.0;       // initial floor; rises with observed |TD|^α
     private readonly alpha: number;
     private readonly eps: number;
+    // Without a cap, one outlier TD (e.g., from a kill reward of ±15) ratchets
+    // maxPrio upward forever — every new transition then enters at that flattened
+    // priority and prioritization stops differentiating. Clipping bounds the
+    // sampling-distribution tail without changing the gradient (Huber already
+    // clips the loss).
+    private readonly maxAbsTdClip: number;
 
-    constructor(capacity: number, alpha = 0.6, eps = 1e-6) {
+    constructor(capacity: number, alpha = 0.6, eps = 1e-6, maxAbsTdClip = 5.0) {
         this.cap = capacity;
         this.obs = new Array(capacity);
         this.next = new Array(capacity);
@@ -58,6 +64,7 @@ export class PrioritizedReplayBuffer {
         this.tree = new Float64Array(2 * p);
         this.alpha = alpha;
         this.eps = eps;
+        this.maxAbsTdClip = maxAbsTdClip;
     }
 
     push(s: Float32Array, a: number, r: number, sNext: Float32Array, done: boolean, nStep: number): void {
@@ -126,10 +133,11 @@ export class PrioritizedReplayBuffer {
         return { s: sBuf, a: aBuf, r: rBuf, sNext: sNextBuf, done: dBuf, nStep: nStepBuf, indices, isWeights: isW };
     }
 
-    // absTdErrors[i] is |TD| for sample i; this method applies α and ε.
+    // absTdErrors[i] is |TD| for sample i; this method applies clip, α and ε.
     updatePriorities(indices: Int32Array, absTdErrors: Float32Array): void {
         for (let k = 0; k < indices.length; k++) {
-            const prio = absTdErrors[k] + this.eps;
+            const clipped = Math.min(absTdErrors[k], this.maxAbsTdClip);
+            const prio = clipped + this.eps;
             const p = Math.pow(prio, this.alpha);
             this._setPriority(indices[k], p);
             if (p > this.maxPrio) this.maxPrio = p;
