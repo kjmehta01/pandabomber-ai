@@ -92,7 +92,7 @@ function parseArgs(): Args {
         seed: 1,
         logEvery: 10,
         poolSize: 10,
-        snapshotEverySteps: 250_000,
+        snapshotEverySteps: 50_000,
         pPool: 0.5,
         numPlayers: 4,
         perAlpha: 0.6,
