@@ -14,16 +14,11 @@
 //   - powerup caps (13), MU spawn odds, death-drop spawn (4 in 5×5 around death)
 //   - corner spawn clearing (3 cells per corner are wood-free)
 //
-// Movement passability uses Math.round() of the target — matches the authoritative
-// server check (gameplayer.ts:48-60). Frontend's ceil/floor + bombWalkingTolerance
-// is client-side smoothing and doesn't affect what the server accepts.
-//
-// Only timing-quantization error: per-cell kill checks fire at the first tick
-// past arrivalMs / arrivalMs+50ms, which can be up to SIM_DT_MS=10ms late vs
-// production's exact setTimeout firings.
-
-export const BOARD_H = 13;
-export const BOARD_W = 19;
+// Board size is configurable per Sim (SimConfig.boardH/boardW). The observation
+// encoder stays fixed at 13×19 — egocentric padding handles smaller boards, so
+// the trained model ports to production unchanged.
+export const DEFAULT_BOARD_H = 13;
+export const DEFAULT_BOARD_W = 19;
 
 export const SIM_DT_MS = 10;
 export const BOMB_FUSE_MS = 3000;
@@ -33,26 +28,35 @@ export const MAX_POWERUPS = 13;
 export const EXPLOSION_TRAVEL_MS = 25; // game.ts:12
 export const DEATH_CHECK_WINDOW_MS = 50; // 2nd checkPlayerDeaths is +50ms in recurseExecute
 
-// Reward weights. Kill > knock > wood ordering chosen so engagement dominates
-// wood-farming when both are available. There is no illegal-action penalty:
-// rollout-time masking (see legalActionMask) prevents the agent from picking
-// rejected actions in the first place, so the penalty would never fire.
-const REWARD_WOOD = 0.5;
-const REWARD_POWERUP = 0.5;
-const REWARD_KNOCK_SCORED = 3.0;
-const REWARD_KNOCK_RECEIVED = -0.2;
-const REWARD_KNOCK_SELF = -0.4;
-const REWARD_KILL_SCORED = 15.0;
-const REWARD_DEATH = -1.5;
-const REWARD_DEATH_SELF = -3.0;
-const REWARD_LAST_ALIVE = 6.0;
-const REWARD_TIMEOUT_SURVIVOR = -1.5;
-const REWARD_PER_TICK_ALIVE = -0.001;
+// Aggression-tuned: kills/engagement dominate; wood is a means, not a goal.
+// No illegal-action penalty — rollout masking (legalActionMask) handles it.
+const REWARD_WOOD = 0.2;
+const REWARD_POWERUP = 0.4;
+const REWARD_KNOCK_SCORED = 4.0;
+const REWARD_KNOCK_RECEIVED = -0.3;
+const REWARD_KNOCK_SELF = -1.0;
+const REWARD_KILL_SCORED = 20.0;
+const REWARD_DEATH = -2.0;
+const REWARD_DEATH_SELF = -4.0;
+const REWARD_LAST_ALIVE = 10.0;
+const REWARD_TIMEOUT_SURVIVOR = -3.0;
+const REWARD_PER_TICK_ALIVE = -0.0005;
+// Paid at bomb placement when an enemy is inside the bomb's cardinal ray
+// (walls block). Pushes the policy to bomb AT opponents, not just at wood.
+const REWARD_BOMB_NEAR_ENEMY = 0.6;
+// Signed shaping per cell of Manhattan-distance change to nearest enemy.
+const REWARD_APPROACH_PER_CELL = 0.02;
 
 const START_MOVE_SPEED = 0.045;
 const MOVE_SPEED_INCREMENT = 0.003;
 // Production: cells/frame = speed*1.667 at 60Hz ⇒ cells/ms = speed*1.667*60/1000.
 const CELLS_PER_MS = (speed: number) => speed * 1.667 * 60 / 1000;
+
+// Delay after woodLeft first hits 0 (or sim start, if no wood) before random
+// ownerless bombs/powerups begin spawning.
+const DEFAULT_RANDOM_SPAWN_DELAY_MS = 30_000;
+const RANDOM_SPAWN_INTERVAL_MS = 2_000;
+const RANDOM_BOMB_POWER = 3;
 
 export type Cell = 'E' | 'S' | 'W' | 'B' | 'NUM' | 'SPE' | 'STR';
 export type Action = 0 | 1 | 2 | 3 | 4 | 5;
@@ -64,12 +68,15 @@ export const ACTION_RIGHT = 4;
 export const ACTION_BOMB = 5;
 export const NUM_ACTIONS = 6;
 
+// Sentinel ownerIdx for ownerless (random/environmental) bombs.
+export const OWNER_RANDOM = -1;
+
 export interface Bomb {
     row: number;
     col: number;
     power: number;
     fuseRemainingMs: number;
-    ownerIdx: number;
+    ownerIdx: number;  // OWNER_RANDOM (-1) for random spawns
 }
 
 export interface SimPlayer {
@@ -96,6 +103,8 @@ export interface SimPlayer {
     numDies: number;
     firstDieTimeMs: number;
     rewardThisStep: number;
+    // Previous min-Manhattan distance to any alive enemy; drives approach shaping.
+    lastEnemyDist: number;
     // Per-game counters for the eval harness; O(1) per event.
     stats: {
         bombsPlaced: number;
@@ -121,6 +130,8 @@ export interface SimPlayer {
             lastAlive: number;
             timeoutSurvivor: number;
             perTick: number;
+            bombNearEnemy: number;
+            approach: number;
         };
     };
 }
@@ -132,7 +143,7 @@ export interface SimPlayer {
 export interface ExplosionCell {
     arrivalMs: number;
     secondCheckMs: number;
-    sourceOwnerIdx: number;
+    sourceOwnerIdx: number; // OWNER_RANDOM (-1) for ownerless bombs
     firstFired: boolean;
     secondFired: boolean;
 }
@@ -147,10 +158,21 @@ const DIRS: Array<[number, number]> = [[-1, 0], [1, 0], [0, -1], [0, 1]];
 
 export interface SimConfig {
     numPlayers: number;
+    boardH?: number;
+    boardW?: number;
     woodOdds?: number;
     powerupOdds?: number;
     seed?: number;
     maxTimeMs?: number;
+    // Starting powerup tier per category (1 = vanilla, capped at MAX_POWERUPS).
+    startBombPower?: number;
+    startMaxBombs?: number;
+    startSpeedTier?: number;
+    // Spawn ownerless bombs/powerups `randomSpawnDelayMs` after woodLeft first
+    // hits 0 (or after sim start when woodOdds=0).
+    randomSpawnsEnabled?: boolean;
+    randomSpawnDelayMs?: number;
+    mapName?: string;
 }
 
 function makeRng(seed: number) {
@@ -164,7 +186,9 @@ function makeRng(seed: number) {
 }
 
 export class Sim {
-    cfg: Required<SimConfig>;
+    cfg: Required<Omit<SimConfig, 'mapName'>> & { mapName: string };
+    boardH: number;
+    boardW: number;
     blocks: (Cell | undefined)[][];
     bombs: (Bomb | undefined)[][];
     powerups: ('NUM' | 'SPE' | 'STR' | undefined)[][];
@@ -175,30 +199,46 @@ export class Sim {
     ranking: number[];
     done: boolean;
     rng: () => number;
+    // Set the first tick woodLeft hits 0 (or at construction if it starts at 0).
+    woodGoneMs: number | null;
+    lastRandomSpawnMs: number;
 
     constructor(cfg: SimConfig) {
+        const startBombPower = cfg.startBombPower ?? 1;
+        const startMaxBombs = cfg.startMaxBombs ?? 1;
+        const startSpeedTier = cfg.startSpeedTier ?? 1;
         this.cfg = {
             numPlayers: cfg.numPlayers,
+            boardH: cfg.boardH ?? DEFAULT_BOARD_H,
+            boardW: cfg.boardW ?? DEFAULT_BOARD_W,
             woodOdds: cfg.woodOdds ?? 0.8,
             powerupOdds: cfg.powerupOdds ?? 0.4,
             seed: cfg.seed ?? Math.floor(Math.random() * 1e9),
             maxTimeMs: cfg.maxTimeMs ?? 180_000,
+            startBombPower,
+            startMaxBombs,
+            startSpeedTier,
+            randomSpawnsEnabled: cfg.randomSpawnsEnabled ?? false,
+            randomSpawnDelayMs: cfg.randomSpawnDelayMs ?? DEFAULT_RANDOM_SPAWN_DELAY_MS,
+            mapName: cfg.mapName ?? `${cfg.boardH ?? DEFAULT_BOARD_H}x${cfg.boardW ?? DEFAULT_BOARD_W}`,
         };
+        this.boardH = this.cfg.boardH;
+        this.boardW = this.cfg.boardW;
         this.rng = makeRng(this.cfg.seed);
 
         this.blocks = [];
         this.bombs = [];
         this.powerups = [];
         this.activeExplosions = [];
-        for (let r = 0; r < BOARD_H; r++) {
-            this.blocks.push(new Array(BOARD_W).fill(undefined));
-            this.bombs.push(new Array(BOARD_W).fill(undefined));
-            this.powerups.push(new Array(BOARD_W).fill(undefined));
+        for (let r = 0; r < this.boardH; r++) {
+            this.blocks.push(new Array(this.boardW).fill(undefined));
+            this.bombs.push(new Array(this.boardW).fill(undefined));
+            this.powerups.push(new Array(this.boardW).fill(undefined));
         }
 
-        for (let r = 0; r < BOARD_H; r++) {
-            for (let c = 0; c < BOARD_W; c++) {
-                if (r === 0 || r === BOARD_H - 1 || c === 0 || c === BOARD_W - 1) {
+        for (let r = 0; r < this.boardH; r++) {
+            for (let c = 0; c < this.boardW; c++) {
+                if (r === 0 || r === this.boardH - 1 || c === 0 || c === this.boardW - 1) {
                     this.blocks[r][c] = 'S';
                 } else if (r % 2 === 0 && c % 2 === 0) {
                     this.blocks[r][c] = 'S';
@@ -208,16 +248,16 @@ export class Sim {
 
         const corners: [number, number][][] = [
             [[1, 1], [1, 2], [2, 1]],
-            [[1, BOARD_W - 2], [1, BOARD_W - 3], [2, BOARD_W - 2]],
-            [[BOARD_H - 2, 1], [BOARD_H - 2, 2], [BOARD_H - 3, 1]],
-            [[BOARD_H - 2, BOARD_W - 2], [BOARD_H - 2, BOARD_W - 3], [BOARD_H - 3, BOARD_W - 2]],
+            [[1, this.boardW - 2], [1, this.boardW - 3], [2, this.boardW - 2]],
+            [[this.boardH - 2, 1], [this.boardH - 2, 2], [this.boardH - 3, 1]],
+            [[this.boardH - 2, this.boardW - 2], [this.boardH - 2, this.boardW - 3], [this.boardH - 3, this.boardW - 2]],
         ];
         const cornerSet = new Set<string>();
         for (const c of corners) for (const [r, x] of c) cornerSet.add(`${r},${x}`);
 
         this.woodLeft = 0;
-        for (let r = 1; r < BOARD_H - 1; r++) {
-            for (let c = 1; c < BOARD_W - 1; c++) {
+        for (let r = 1; r < this.boardH - 1; r++) {
+            for (let c = 1; c < this.boardW - 1; c++) {
                 if (this.blocks[r][c]) continue;
                 if (cornerSet.has(`${r},${c}`)) continue;
                 if (this.rng() < this.cfg.woodOdds) {
@@ -229,15 +269,21 @@ export class Sim {
 
         const corner: [number, number][] = [
             [1, 1],
-            [1, BOARD_W - 2],
-            [BOARD_H - 2, 1],
-            [BOARD_H - 2, BOARD_W - 2],
+            [1, this.boardW - 2],
+            [this.boardH - 2, 1],
+            [this.boardH - 2, this.boardW - 2],
         ];
         const order = [0, 1, 2, 3];
         for (let i = order.length - 1; i > 0; i--) {
             const j = Math.floor(this.rng() * (i + 1));
             [order[i], order[j]] = [order[j], order[i]];
         }
+
+        // Tier N = N-1 free pickups of that type.
+        const startMoveSpeed = START_MOVE_SPEED + Math.max(0, startSpeedTier - 1) * MOVE_SPEED_INCREMENT;
+        const startBombPowerClamped = Math.min(MAX_POWERUPS, Math.max(1, startBombPower));
+        const startMaxBombsClamped = Math.min(MAX_POWERUPS, Math.max(1, startMaxBombs));
+
         this.players = [];
         for (let i = 0; i < this.cfg.numPlayers; i++) {
             const [py, px] = corner[order[i]];
@@ -245,15 +291,20 @@ export class Sim {
                 idx: i, alive: true, knocked: false, immuneMs: 0, knockMsLeft: 0,
                 y: py, x: px, dyDir: 0, dxDir: 0, moveTargetY: py, moveTargetX: px,
                 pendingAction: ACTION_STAY,
-                moveSpeed: START_MOVE_SPEED, bombPower: 1, maxBombs: 1, placedBombs: 0,
+                moveSpeed: startMoveSpeed,
+                bombPower: startBombPowerClamped,
+                maxBombs: startMaxBombsClamped,
+                placedBombs: 0,
                 lastDeathRow: -1, lastDeathCol: -1, numDies: 0, firstDieTimeMs: -1,
                 rewardThisStep: 0,
+                lastEnemyDist: -1,
                 stats: {
                     bombsPlaced: 0, woodDestroyed: 0, powerupsCollected: 0, knocksScored: 0, killsScored: 0,
                     diedFromOwnBomb: 0, illegalMoves: 0, illegalBombs: 0, knocksReceived: 0,
                     rewardBreakdown: {
                         wood: 0, powerup: 0, knockScored: 0, knockReceived: 0, knockSelf: 0, killScored: 0,
                         death: 0, deathSelf: 0, lastAlive: 0, timeoutSurvivor: 0, perTick: 0,
+                        bombNearEnemy: 0, approach: 0,
                     },
                 },
             });
@@ -261,6 +312,9 @@ export class Sim {
         this.elapsedMs = 0;
         this.ranking = [];
         this.done = false;
+        this.woodGoneMs = this.woodLeft === 0 ? 0 : null;
+        // Negative so the first spawn fires the tick the delay window opens.
+        this.lastRandomSpawnMs = -RANDOM_SPAWN_INTERVAL_MS;
     }
 
     private addReward(p: SimPlayer, source: keyof SimPlayer['stats']['rewardBreakdown'], amount: number) {
@@ -269,7 +323,7 @@ export class Sim {
     }
 
     getCell(r: number, c: number): Cell {
-        if (r < 0 || r >= BOARD_H || c < 0 || c >= BOARD_W) return 'S';
+        if (r < 0 || r >= this.boardH || c < 0 || c >= this.boardW) return 'S';
         if (this.blocks[r][c] === 'S') return 'S';
         if (this.blocks[r][c] === 'W') return 'W';
         if (this.bombs[r][c]) return 'B';
@@ -351,6 +405,25 @@ export class Sim {
         }
     }
 
+    // True if (br,bc) with `power` has any non-self alive enemy in its cardinal
+    // ray (stone/wood block). Drives REWARD_BOMB_NEAR_ENEMY.
+    private bombCoversEnemy(br: number, bc: number, power: number, ownerIdx: number): boolean {
+        for (const [dy, dx] of DIRS) {
+            for (let i = 1; i <= power; i++) {
+                const r = br + dy * i;
+                const c = bc + dx * i;
+                if (r < 0 || r >= this.boardH || c < 0 || c >= this.boardW) break;
+                if (this.blocks[r][c] === 'S') break;
+                if (this.blocks[r][c] === 'W') break;
+                for (const e of this.players) {
+                    if (!e.alive || e.idx === ownerIdx) continue;
+                    if (Math.round(e.y) === r && Math.round(e.x) === c) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private placeBomb(p: SimPlayer, r: number, c: number) {
         if (p.placedBombs >= p.maxBombs || this.bombs[r][c] || this.blocks[r][c]) {
             p.stats.illegalBombs++;
@@ -359,6 +432,16 @@ export class Sim {
         this.bombs[r][c] = { row: r, col: c, power: p.bombPower, fuseRemainingMs: BOMB_FUSE_MS, ownerIdx: p.idx };
         p.placedBombs++;
         p.stats.bombsPlaced++;
+        // Paid at placement (not detonation) so the bonus survives a dodge.
+        if (this.bombCoversEnemy(r, c, p.bombPower, p.idx)) {
+            this.addReward(p, 'bombNearEnemy', REWARD_BOMB_NEAR_ENEMY);
+        }
+    }
+
+    // Ownerless: doesn't touch any player's bomb cap; damage/wood credit skipped.
+    private placeRandomBomb(r: number, c: number) {
+        if (this.bombs[r][c] || this.blocks[r][c]) return;
+        this.bombs[r][c] = { row: r, col: c, power: RANDOM_BOMB_POWER, fuseRemainingMs: BOMB_FUSE_MS, ownerIdx: OWNER_RANDOM };
     }
 
     private movePlayers(dtMs: number) {
@@ -389,15 +472,15 @@ export class Sim {
     /* ─── explosion machinery ────────────────────────────────────────── */
 
     private advanceBombs(dtMs: number) {
-        for (let r = 0; r < BOARD_H; r++) {
-            for (let c = 0; c < BOARD_W; c++) {
+        for (let r = 0; r < this.boardH; r++) {
+            for (let c = 0; c < this.boardW; c++) {
                 const b = this.bombs[r][c];
                 if (b) b.fuseRemainingMs -= dtMs;
             }
         }
         const processed = new Set<Bomb>();
-        for (let r = 0; r < BOARD_H; r++) {
-            for (let c = 0; c < BOARD_W; c++) {
+        for (let r = 0; r < this.boardH; r++) {
+            for (let c = 0; c < this.boardW; c++) {
                 const b = this.bombs[r][c];
                 if (!b) continue;
                 if (b.fuseRemainingMs > 0) continue;
@@ -421,7 +504,7 @@ export class Sim {
                 for (let i = 1; i <= b.power; i++) {
                     const r = b.row + dy * i;
                     const c = b.col + dx * i;
-                    if (r < 0 || r >= BOARD_H || c < 0 || c >= BOARD_W) break;
+                    if (r < 0 || r >= this.boardH || c < 0 || c >= this.boardW) break;
                     if (this.blocks[r][c] === 'S') break;
                     if (this.blocks[r][c] === 'W') break;
                     const other = this.bombs[r][c];
@@ -466,7 +549,7 @@ export class Sim {
                 for (let i = 1; i <= b.power; i++) {
                     const r = b.row + dy * i;
                     const c = b.col + dx * i;
-                    if (r < 0 || r >= BOARD_H || c < 0 || c >= BOARD_W) break;
+                    if (r < 0 || r >= this.boardH || c < 0 || c >= this.boardW) break;
                     if (this.blocks[r][c] === 'S') break;
                     const arrivalT = explodeAt + i * EXPLOSION_TRAVEL_MS;
                     upsert(r, c, arrivalT, b.ownerIdx);
@@ -477,7 +560,10 @@ export class Sim {
 
         for (const b of centers) {
             this.bombs[b.row][b.col] = undefined;
-            this.players[b.ownerIdx].placedBombs--;
+            // Ownerless bombs don't count against any player's bomb cap.
+            if (b.ownerIdx !== OWNER_RANDOM) {
+                this.players[b.ownerIdx].placedBombs--;
+            }
         }
 
         this.activeExplosions.push({ cells });
@@ -498,9 +584,14 @@ export class Sim {
                     if (this.blocks[r][c] === 'W') {
                         this.blocks[r][c] = undefined;
                         this.woodLeft--;
-                        this.addReward(this.players[cell.sourceOwnerIdx], 'wood', REWARD_WOOD);
-                        this.players[cell.sourceOwnerIdx].stats.woodDestroyed++;
+                        if (cell.sourceOwnerIdx !== OWNER_RANDOM) {
+                            this.addReward(this.players[cell.sourceOwnerIdx], 'wood', REWARD_WOOD);
+                            this.players[cell.sourceOwnerIdx].stats.woodDestroyed++;
+                        }
                         this.maybeSpawnPowerup(r, c);
+                        if (this.woodLeft === 0 && this.woodGoneMs === null) {
+                            this.woodGoneMs = this.elapsedMs;
+                        }
                     }
                     this.killCheck(r, c, cell.sourceOwnerIdx);
                 }
@@ -523,14 +614,16 @@ export class Sim {
         for (const p of this.players) {
             if (!p.alive) continue;
             if (Math.round(p.y) === r && Math.round(p.x) === c) {
-                this.damagePlayer(p, this.players[attackerIdx]);
+                const attacker = attackerIdx === OWNER_RANDOM ? null : this.players[attackerIdx];
+                this.damagePlayer(p, attacker);
             }
         }
     }
 
     /* ─── player damage / death ──────────────────────────────────────── */
 
-    private damagePlayer(p: SimPlayer, attacker: SimPlayer) {
+    // attacker = null for environmental (random-bomb) damage.
+    private damagePlayer(p: SimPlayer, attacker: SimPlayer | null) {
         if (p.immuneMs > 0) return;
         p.immuneMs = INVULNERABILITY_MS;
 
@@ -540,6 +633,8 @@ export class Sim {
             p.knocked = true;
             p.knockMsLeft = KNOCK_DURATION_MS;
             p.dyDir = 0; p.dxDir = 0; // production freezes knocked players
+            p.lastEnemyDist = -1;     // avoid stale delta on wake-up
+
             if (row === p.lastDeathRow && col === p.lastDeathCol && this.elapsedMs - p.firstDieTimeMs < 19_000) {
                 if (p.numDies === 2) {
                     this.kill(p, attacker);
@@ -552,12 +647,14 @@ export class Sim {
                 p.numDies = 1;
                 p.firstDieTimeMs = this.elapsedMs;
             }
-            if (attacker !== p) {
+            if (attacker !== null && attacker !== p) {
                 this.addReward(attacker, 'knockScored', REWARD_KNOCK_SCORED);
                 attacker.stats.knocksScored++;
                 this.addReward(p, 'knockReceived', REWARD_KNOCK_RECEIVED);
-            } else {
+            } else if (attacker === p) {
                 this.addReward(p, 'knockSelf', REWARD_KNOCK_SELF);
+            } else {
+                this.addReward(p, 'knockReceived', REWARD_KNOCK_RECEIVED);
             }
             p.stats.knocksReceived++;
         } else {
@@ -565,18 +662,20 @@ export class Sim {
         }
     }
 
-    private kill(p: SimPlayer, attacker: SimPlayer) {
+    private kill(p: SimPlayer, attacker: SimPlayer | null) {
         p.alive = false;
         p.knocked = false;
         p.dyDir = 0; p.dxDir = 0;
         if (!this.ranking.includes(p.idx)) this.ranking.unshift(p.idx);
-        if (attacker !== p) {
+        if (attacker !== null && attacker !== p) {
             this.addReward(attacker, 'killScored', REWARD_KILL_SCORED);
             attacker.stats.killsScored++;
             this.addReward(p, 'death', REWARD_DEATH);
-        } else {
+        } else if (attacker === p) {
             p.stats.diedFromOwnBomb = 1;
             this.addReward(p, 'deathSelf', REWARD_DEATH_SELF);
+        } else {
+            this.addReward(p, 'death', REWARD_DEATH);
         }
 
         const numDrop = 4;
@@ -585,7 +684,7 @@ export class Sim {
             for (let dx = -2; dx <= 2; dx++) {
                 const r = Math.round(p.y) + dy;
                 const c = Math.round(p.x) + dx;
-                if (r > 0 && r < BOARD_H - 1 && c > 0 && c < BOARD_W - 1 && this.getCell(r, c) === 'E') {
+                if (r > 0 && r < this.boardH - 1 && c > 0 && c < this.boardW - 1 && this.getCell(r, c) === 'E') {
                     spots.push([r, c]);
                 }
             }
@@ -647,6 +746,78 @@ export class Sim {
         }
     }
 
+    // Interior cells with no block, bomb, powerup, or alive player.
+    private listEmptyCellsForRandomSpawn(): [number, number][] {
+        const occupied = new Set<number>();
+        for (const pl of this.players) {
+            if (!pl.alive) continue;
+            const r = Math.round(pl.y);
+            const c = Math.round(pl.x);
+            occupied.add(r * this.boardW + c);
+        }
+        const out: [number, number][] = [];
+        for (let r = 1; r < this.boardH - 1; r++) {
+            for (let c = 1; c < this.boardW - 1; c++) {
+                if (this.blocks[r][c]) continue;
+                if (this.bombs[r][c]) continue;
+                if (this.powerups[r][c]) continue;
+                if (occupied.has(r * this.boardW + c)) continue;
+                out.push([r, c]);
+            }
+        }
+        return out;
+    }
+
+    // One ownerless bomb + one powerup at random empty cells, every
+    // RANDOM_SPAWN_INTERVAL_MS once the post-wood delay has elapsed.
+    private maybeRandomSpawn() {
+        if (!this.cfg.randomSpawnsEnabled) return;
+        if (this.woodGoneMs === null) return;
+        if (this.elapsedMs - this.woodGoneMs < this.cfg.randomSpawnDelayMs) return;
+        if (this.elapsedMs - this.lastRandomSpawnMs < RANDOM_SPAWN_INTERVAL_MS) return;
+        this.lastRandomSpawnMs = this.elapsedMs;
+
+        const cells = this.listEmptyCellsForRandomSpawn();
+        if (cells.length === 0) return;
+        const [br, bc] = cells[Math.floor(this.rng() * cells.length)];
+        this.placeRandomBomb(br, bc);
+        // Re-list — the bomb just consumed one cell.
+        const cells2 = this.listEmptyCellsForRandomSpawn();
+        if (cells2.length > 0) {
+            const [pr, pc] = cells2[Math.floor(this.rng() * cells2.length)];
+            this.placePowerupRandom(pr, pc);
+        }
+    }
+
+    // -1 if no alive enemies.
+    private nearestEnemyDist(p: SimPlayer): number {
+        let best = -1;
+        const pr = Math.round(p.y), pc = Math.round(p.x);
+        for (const e of this.players) {
+            if (!e.alive || e.idx === p.idx) continue;
+            const d = Math.abs(Math.round(e.y) - pr) + Math.abs(Math.round(e.x) - pc);
+            if (best < 0 || d < best) best = d;
+        }
+        return best;
+    }
+
+    // Reward = REWARD_APPROACH_PER_CELL × (lastDist − curDist), sampled at
+    // cell-aligned ticks. Skip while knocked; damagePlayer clears lastEnemyDist
+    // on knock entry so the 6s freeze can't produce a stale delta on wake-up.
+    private applyApproachShaping() {
+        for (const p of this.players) {
+            if (!p.alive || p.knocked) continue;
+            if (!this.isAtCell(p.idx)) continue;
+            const d = this.nearestEnemyDist(p);
+            if (d < 0) { p.lastEnemyDist = -1; continue; }
+            if (p.lastEnemyDist >= 0 && d !== p.lastEnemyDist) {
+                const delta = p.lastEnemyDist - d; // + = closing, - = retreating
+                this.addReward(p, 'approach', REWARD_APPROACH_PER_CELL * delta);
+            }
+            p.lastEnemyDist = d;
+        }
+    }
+
     private gameOver(): boolean {
         const alive = this.players.filter(p => p.alive);
         if (alive.length === 0) return true;
@@ -686,6 +857,8 @@ export class Sim {
         this.processActiveExplosions();
         // Collect after explosions so powerups spawned from this tick's wood are pickable.
         this.collectPowerups();
+        this.maybeRandomSpawn();
+        this.applyApproachShaping();
         this.updateTimers(SIM_DT_MS);
 
         // Per-step survival penalty so STAY isn't the universally safest pick.

@@ -1,7 +1,7 @@
 // RL wrapper around Sim. Builds per-player ObsView so the same encoder runs in
 // training and inference; a new action only takes effect at cell-aligned ticks.
 
-import { Sim, SimConfig, Action, ACTION_STAY, BOARD_H, BOARD_W, Bomb } from './sim';
+import { Sim, SimConfig, Action, ACTION_STAY, Bomb } from './sim';
 import { encode, ObsView } from './observation';
 
 export interface StepResult {
@@ -21,8 +21,8 @@ export class Env {
     private buildView(playerIdx: number): ObsView {
         const me = this.sim.players[playerIdx];
         const bombsFlat: Bomb[] = [];
-        for (let r = 0; r < BOARD_H; r++) {
-            for (let c = 0; c < BOARD_W; c++) {
+        for (let r = 0; r < this.sim.boardH; r++) {
+            for (let c = 0; c < this.sim.boardW; c++) {
                 const b = this.sim.bombs[r][c];
                 if (b) bombsFlat.push(b);
             }
@@ -37,8 +37,8 @@ export class Env {
             }
         }
         return {
-            boardH: BOARD_H,
-            boardW: BOARD_W,
+            boardH: this.sim.boardH,
+            boardW: this.sim.boardW,
             getCell: (r: number, c: number) => this.sim.getCell(r, c),
             bombs: bombsFlat.map(b => ({ row: b.row, col: b.col, power: b.power, fuseRemainingMs: b.fuseRemainingMs })),
             self: {

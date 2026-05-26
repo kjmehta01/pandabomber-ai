@@ -32,6 +32,7 @@ import {
 import { OBS_SIZE, BOARD_H, BOARD_W, NUM_CHANNELS, NUM_SCALARS, legalMaskFromObs } from './observation';
 import { Action } from './sim';
 import { PrioritizedReplayBuffer } from './per';
+import { MAPS, mapForEpisode } from './maps';
 
 interface Args {
     episodes: number;
@@ -342,10 +343,14 @@ async function train() {
 
     for (let ep = startEpisode; ep < startEpisode + args.episodes; ep++) {
         const numPlayers = args.numPlayers;
+        // Round-robin the curriculum: diversity across map size, wood density,
+        // and start tier keeps the policy from plateauing on wood-clearing.
+        const mapPreset = mapForEpisode(ep);
         const env = new Env({
             numPlayers,
             seed: args.seed + ep,
             maxTimeMs: 60_000,
+            ...mapPreset,
         });
 
         // Independently freeze each opponent seat for this episode.
@@ -585,9 +590,10 @@ async function train() {
             `Kn+${rb.knockScored.toFixed(1)} Kn${rb.knockReceived.toFixed(1)} ` +
             `Kill${rb.killScored.toFixed(1)} D${rb.death.toFixed(1)} ` +
             `LA${rb.lastAlive.toFixed(1)} TO${rb.timeoutSurvivor.toFixed(1)} ` +
-            `Tik${rb.perTick.toFixed(1)}`;
+            `Tik${rb.perTick.toFixed(1)} ` +
+            `BNE${rb.bombNearEnemy.toFixed(1)} App${rb.approach.toFixed(2)}`;
         console.log(
-            `[train] ep=${ep} step=${globalStep} eps=${epsilon(globalStep, args).toFixed(3)} ` +
+            `[train] ep=${ep} step=${globalStep} map=${mapPreset.name} eps=${epsilon(globalStep, args).toFixed(3)} ` +
             `np=${numPlayers} rLearner=${totalReward[0].toFixed(2)} rOpp=${oppRewardMean.toFixed(2)} ` +
             `wood=${ls.woodDestroyed} kills=${ls.killsScored} kSc=${ls.knocksScored} kRcv=${ls.knocksReceived} ` +
             `illM=${ls.illegalMoves} illB=${ls.illegalBombs} alive=${learnerPlayer.alive ? 1 : 0} ` +
