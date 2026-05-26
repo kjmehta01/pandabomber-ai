@@ -42,10 +42,12 @@ const REWARD_LAST_ALIVE = 10.0;
 const REWARD_TIMEOUT_SURVIVOR = -3.0;
 const REWARD_PER_TICK_ALIVE = -0.0005;
 // Paid at bomb placement when an enemy is inside the bomb's cardinal ray
-// (walls block). Pushes the policy to bomb AT opponents, not just at wood.
-const REWARD_BOMB_NEAR_ENEMY = 0.6;
+// within BNE_MAX_DIST cells (walls block). Distance gate prevents corner-
+// camping spam from paying out on small maps with high bomb power.
+const REWARD_BOMB_NEAR_ENEMY = 0.1;
+const BNE_MAX_DIST = 3;
 // Signed shaping per cell of Manhattan-distance change to nearest enemy.
-const REWARD_APPROACH_PER_CELL = 0.02;
+const REWARD_APPROACH_PER_CELL = 0.05;
 
 const START_MOVE_SPEED = 0.045;
 const MOVE_SPEED_INCREMENT = 0.003;
@@ -405,11 +407,12 @@ export class Sim {
         }
     }
 
-    // True if (br,bc) with `power` has any non-self alive enemy in its cardinal
-    // ray (stone/wood block). Drives REWARD_BOMB_NEAR_ENEMY.
+    // True if (br,bc) has any non-self alive enemy in its cardinal ray within
+    // min(power, BNE_MAX_DIST) cells (stone/wood block). Drives REWARD_BOMB_NEAR_ENEMY.
     private bombCoversEnemy(br: number, bc: number, power: number, ownerIdx: number): boolean {
+        const range = Math.min(power, BNE_MAX_DIST);
         for (const [dy, dx] of DIRS) {
-            for (let i = 1; i <= power; i++) {
+            for (let i = 1; i <= range; i++) {
                 const r = br + dy * i;
                 const c = bc + dx * i;
                 if (r < 0 || r >= this.boardH || c < 0 || c >= this.boardW) break;
