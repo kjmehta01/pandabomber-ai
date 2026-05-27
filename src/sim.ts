@@ -30,21 +30,21 @@ export const DEATH_CHECK_WINDOW_MS = 50; // 2nd checkPlayerDeaths is +50ms in re
 
 // Aggression-tuned: kills/engagement dominate; wood is a means, not a goal.
 // No illegal-action penalty — rollout masking (legalActionMask) handles it.
-const REWARD_WOOD = 0.2;
-const REWARD_POWERUP = 0.4;
+const REWARD_WOOD = 0.3;
+const REWARD_POWERUP = 0.5;
 const REWARD_KNOCK_SCORED = 4.0;
-const REWARD_KNOCK_RECEIVED = -0.3;
-const REWARD_KNOCK_SELF = -1.0;
+const REWARD_KNOCK_RECEIVED = -3.0;
+const REWARD_KNOCK_SELF = -0.2;
 const REWARD_KILL_SCORED = 20.0;
-const REWARD_DEATH = -2.0;
-const REWARD_DEATH_SELF = -4.0;
-const REWARD_LAST_ALIVE = 10.0;
-const REWARD_TIMEOUT_SURVIVOR = -3.0;
-const REWARD_PER_TICK_ALIVE = -0.0005;
+const REWARD_DEATH = -10.0;
+const REWARD_DEATH_SELF = -3.0;
+const REWARD_LAST_ALIVE = 0.0;
+const REWARD_TIMEOUT_SURVIVOR = 0.0;
+const REWARD_PER_TICK_ALIVE = -0.001;
 // Paid at bomb placement when an enemy is inside the bomb's cardinal ray
 // within BNE_MAX_DIST cells (walls block). Distance gate prevents corner-
 // camping spam from paying out on small maps with high bomb power.
-const REWARD_BOMB_NEAR_ENEMY = 0.1;
+const REWARD_BOMB_NEAR_ENEMY = 0.3;
 const BNE_MAX_DIST = 3;
 // Signed shaping per cell of Manhattan-distance change to nearest enemy.
 const REWARD_APPROACH_PER_CELL = 0.05;
@@ -56,7 +56,7 @@ const CELLS_PER_MS = (speed: number) => speed * 1.667 * 60 / 1000;
 
 // Delay after woodLeft first hits 0 (or sim start, if no wood) before random
 // ownerless bombs/powerups begin spawning.
-const DEFAULT_RANDOM_SPAWN_DELAY_MS = 30_000;
+const DEFAULT_RANDOM_SPAWN_DELAY_MS = 60_000;
 const RANDOM_SPAWN_INTERVAL_MS = 2_000;
 const RANDOM_BOMB_POWER = 3;
 
